@@ -47,30 +47,23 @@ class PolyValue(nn.Module):
         return out
 
 class POEMVPolicy(nn.Module):
-    """2-asset independent Gaussian policy; per-asset (phi1, phi2, phi3)."""
+    """Gaussian policy with scalar parameters phi1, phi2, phi3."""
     def __init__(self):
         super().__init__()
-        # shape (2,3): rows are assets, cols are (phi1,phi2,phi3)
-        self.phi = nn.Parameter(torch.zeros((2,3), dtype=torch.float64))
+        self.phi = nn.Parameter(torch.zeros((3,), dtype=torch.float64))
 
     def dist_params(self, x: torch.Tensor, omega: torch.Tensor, p: torch.Tensor, dlnf_dp: torch.Tensor,
                     f: torch.Tensor, Lambda: float,sigma: float):
-        # x, p, f are (n,) or (1,)
-        # returns mean:(n,2), std:(n,2)
-        inv_sigma2 = 1.0 / (sigma * sigma)  # use a scalar scale for both assets (keeps config simple)
+        phi1, phi2, phi3 = self.phi[0], self.phi[1], self.phi[2]
+        inv_sigma2 = 1.0 / (sigma * sigma)
         # mean = -(x-omega) * [phi1*(p - (f_p/f) p(1-p)) + phi2]
         adj = p - dlnf_dp * p * (1.0 - p)
-        phi1 = self.phi[:,0]  # (2,)
-        phi2 = self.phi[:,1]  # (2,)
-        phi3 = self.phi[:,2]  # (2,)
-
-        base = (-(x - omega) * (adj)).unsqueeze(-1)  # (n,1)
-        mean = inv_sigma2 * (base * phi1.view(1,2) + (-(x-omega)).unsqueeze(-1) * phi2.view(1,2))
-
-        Lam = torch.as_tensor(Lambda, dtype=x.dtype, device=x.device)
-        var = inv_sigma2 * (Lam * torch.exp(phi3.view(1,2)) * f.unsqueeze(-1))
-        var = var.clamp(min=1e-24, max=100.0)
-        std = torch.sqrt(var)  # (n,2)
+        #mean = -(x - omega) * (phi1 * adj + phi2)
+        #var = torch.as_tensor(Lambda, dtype=torch.float64) * torch.exp(phi3) * f
+        mean = inv_sigma2 * (-(x - omega) * (phi1 * adj + phi2))
+        var = inv_sigma2 * (torch.as_tensor(Lambda, dtype=x.dtype, device=x.device) * torch.exp(phi3) * f)
+        var = var.clamp(min=1e-24, max=100.0)   # std in [1e-12, 10]
+        std = torch.sqrt(var)
         return mean, std
 
 def value_fn(t: torch.Tensor, x: torch.Tensor, p: torch.Tensor, omega: torch.Tensor, z: float,

@@ -40,26 +40,19 @@ def label_bull_bear_from_drawdowns(S: np.ndarray, thr: HeuristicThresholds):
     return reg
 
 def estimate_env_params_from_labeled_returns(returns: np.ndarray, reg: np.ndarray, dt: float):
-    """Estimate mu_i (2,), Sigma_i (2,2), and lambda_i from labeled regimes.
+    """Estimate mu_i and lambda_i from labeled regimes; sigma from all returns.
 
-    - mu_i: annualized mean of (simple) returns in regime i (vector)
-    - Sigma_i: annualized cov of (log) returns in regime i (matrix)
+    - mu_i: annualized mean of returns in regime i divided by dt (approx)
+    - sigma: annualized std of returns / sqrt(dt) (approx)
     - lambda_i: reciprocal of average time spent in regime i (years)
     """
     # log-returns are more natural; for small dt either works. We'll use log(1+r) if needed.
-    daily = np.asarray(returns, dtype=float)  # (T,2)
-    if daily.ndim != 2 or daily.shape[1] != 2:
-        raise ValueError("returns must be shape (T,2) for 2-asset mode")
-
+    daily = returns
     days_per_year = int(round(1/dt))
-    # use simple returns for mean (approx), log returns for cov
-    mu1 = annualize_mean(daily[reg[:-1]==1].mean(axis=0), days_per_year)
-    mu2 = annualize_mean(daily[reg[:-1]==2].mean(axis=0), days_per_year)
-
-    # approximate log returns
-    logret = np.log1p(daily)
-    Sigma1 = np.cov(logret[reg[:-1]==1].T, ddof=1) * days_per_year
-    Sigma2 = np.cov(logret[reg[:-1]==2].T, ddof=1) * days_per_year
+    # mu approx from E[dS/S]/dt
+    mu1 = annualize_mean(daily[reg[:-1]==1].mean(), days_per_year)
+    mu2 = annualize_mean(daily[reg[:-1]==2].mean(), days_per_year)
+    sigma = annualize_std(daily.std(ddof=1), days_per_year)
 
     # estimate average sojourn time in each regime (in years)
     durations = {1: [], 2: []}
@@ -76,6 +69,4 @@ def estimate_env_params_from_labeled_returns(returns: np.ndarray, reg: np.ndarra
     avg2 = np.mean(durations[2]) if len(durations[2]) else dt
     lam1 = 1.0 / avg1  # 1->2 intensity approx reciprocal of time in 1
     lam2 = 1.0 / avg2  # 2->1 intensity approx reciprocal of time in 2
-    return dict(mu1=np.asarray(mu1, float), mu2=np.asarray(mu2, float),
-                Sigma1=np.asarray(Sigma1, float), Sigma2=np.asarray(Sigma2, float),
-                lam1=float(lam1), lam2=float(lam2))
+    return dict(mu1=float(mu1), mu2=float(mu2), sigma=float(sigma), lam1=float(lam1), lam2=float(lam2))

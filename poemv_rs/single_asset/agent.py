@@ -5,7 +5,8 @@ import torch
 import torch.nn.utils as nn_utils
 import torch.optim as optim
 from dataclasses import dataclass
-from .models import PolyValue, POEMVPolicy,value_fn
+from .models import PolyValue, POEMVPolicy, value_fn
+from .filtering import FilterParams, wonham_filter_q_update
 from .utils import safe_clip_p
 
 @dataclass
@@ -38,9 +39,9 @@ class POEMVAgent:
         self.cfg = cfg
         self.vf = PolyValue(T=cfg.T_years, m=cfg.m_poly, mg=cfg.mg_poly).to(cfg.device)
         self.pi = POEMVPolicy().to(cfg.device)
+        self.pi = POEMVPolicy().to(cfg.device)
         with torch.no_grad():
-            # set per-asset phi3 init
-            self.pi.phi[:,2].fill_(cfg.phi3_init)
+            self.pi.phi[2].fill_(cfg.phi3_init)
         self.omega = torch.tensor(cfg.omega_init, dtype=cfg.dtype, device=cfg.device)
         #self.opt_theta = optim.SGD(self.vf.parameters(), lr=cfg.alpha_theta)
         #self.opt_phi = optim.SGD(self.pi.parameters(), lr=cfg.alpha_phi)
@@ -60,19 +61,25 @@ class POEMVAgent:
 
         f = self.vf.f(t_t, p_t)
         dlnf = self.vf.dlnf_dp(t_t, p_t)
-        mean, std = self.pi.dist_params(x_t, self.omega, p_t, dlnf, f, cfg.Lambda, cfg.sigma)  # (1,2),(1,2)
-        eps = torch.randn_like(mean)
-        u_raw = (mean + std * eps).detach().cpu().numpy().reshape(2,)
-        a = (cfg.a_max * np.tanh(u_raw)).astype(float)
+        #mean, std = self.pi.dist_params(x_t, self.omega, p_t, dlnf, f, cfg.Lambda)
+        mean, std = self.pi.dist_params(x_t, self.omega, p_t, dlnf, f, cfg.Lambda, cfg.sigma)
+        eps = torch.randn_like(std)
+        #u = (mean + std*eps).detach().cpu().numpy().item()
+        #logprob = (-0.5*(((torch.tensor([u], dtype=cfg.dtype, device=cfg.device)-mean)/std)**2)
+        #           - torch.log(std) - 0.5*np.log(2*np.pi)).squeeze()
+        #entropy = (0.5*torch.log(2*np.pi*np.e*std*std)).squeeze()
+        u_raw = (mean + std * eps).detach().cpu().numpy().item()
+        a = float(cfg.a_max * np.tanh(u_raw))
         return a, u_raw, None
+
 
     def update_from_episode(self, traj):
         cfg = self.cfg
         t = torch.tensor(traj["t"], dtype=cfg.dtype, device=cfg.device)   # (n+1,)
         x = torch.tensor(traj["x"], dtype=cfg.dtype, device=cfg.device)   # (n+1,)
         p = torch.tensor(traj["p"], dtype=cfg.dtype, device=cfg.device)   # (n+1,)
-        u = torch.tensor(traj["u"], dtype=cfg.dtype, device=cfg.device)         # (n,2)
-        u_raw = torch.tensor(traj["u_raw"], dtype=cfg.dtype, device=cfg.device) # (n,2)
+        u = torch.tensor(traj["u"], dtype=cfg.dtype, device=cfg.device)   # (n,)
+        u_raw = torch.tensor(traj["u_raw"], dtype=cfg.dtype, device=cfg.device)  # (n,)
         a_max = float(traj.get("a_max", cfg.a_max))
         a_max_t = torch.tensor(a_max, dtype=cfg.dtype, device=cfg.device)
 
@@ -90,20 +97,25 @@ class POEMVAgent:
         with torch.no_grad():
             f = self.vf.f(t0, p0)                      # (n,)
             dlnf = self.vf.dlnf_dp(t0, p0)             # (n,)
-        mean, std = self.pi.dist_params(x0, self.omega, p0, dlnf, f, cfg.Lambda, cfg.sigma)  # (n,2),(n,2)
-        std = std.clamp(min=1e-12)  # (n,2)
+        mean, std = self.pi.dist_params(x0, self.omega, p0, dlnf, f, cfg.Lambda, cfg.sigma)
+        std = std.clamp(min=1e-12)
 
-        # entropy
+        # entropy H_k = 0.5*log(2*pi*e*std^2) = 0.5*log(2*pi*e) + log(std)
         ENT_CONST = 0.5 * math.log(2.0 * math.pi * math.e)
-        entropy = (ENT_CONST + torch.log(std)).sum(dim=-1)       # (n,)
+        entropy = ENT_CONST + torch.log(std)       # (n,)
+
         # logprob under current policy for *executed* (squashed) action
+        # First compute log p(u_raw) under Normal(mean,std)
         LOG_SQRT_2PI = 0.5 * math.log(2.0 * math.pi)
+        #z = (u - mean) / std
+        #logprob = (-0.5 * z**2 - torch.log(std) - LOG_SQRT_2PI)  # (n,)
         z = (u_raw - mean) / std
-        logprob_raw = (-0.5 * z**2 - torch.log(std) - LOG_SQRT_2PI).sum(dim=-1)  # (n,)
-        tanh_u = torch.tanh(u_raw)  # (n,2)
+        logprob_raw = (-0.5 * z**2 - torch.log(std) - LOG_SQRT_2PI)  # (n,)
+        # squash: a = a_max * tanh(u_raw)
+        tanh_u = torch.tanh(u_raw)
         # Jacobian: |da/du| = a_max * (1 - tanh^2(u))
-        log_det = (torch.log(a_max_t) + torch.log((1.0 - tanh_u**2).clamp(min=1e-12))).sum(dim=-1)
-        logprob = logprob_raw - log_det  # (n,)
+        log_det = torch.log(a_max_t) + torch.log((1.0 - tanh_u**2).clamp(min=1e-12))
+        logprob = logprob_raw - log_det
 
         # (Optional) enforce consistency between stored executed action and squash(u_raw)
         # Comment out if you intentionally store something else in traj["u"].
@@ -143,7 +155,7 @@ class POEMVAgent:
 
         # clamp phi3 (log-variance control) after update to prevent variance blow-up
         with torch.no_grad():
-            self.pi.phi[:,2].clamp_(cfg.phi3_min, cfg.phi3_max)
+            self.pi.phi[2].clamp_(cfg.phi3_min, cfg.phi3_max)
 
         return float(loss_critic.detach().cpu()), float(loss_actor.detach().cpu())
 
@@ -155,4 +167,4 @@ class POEMVAgent:
 
     def phi_values(self):
         v = self.pi.phi.detach().cpu().numpy()
-        return dict(phi1=float(v[0,0]), phi2=float(v[0,1]), phi3=float(v[0,2]))
+        return dict(phi1=float(v[0]), phi2=float(v[1]), phi3=float(v[2]))
