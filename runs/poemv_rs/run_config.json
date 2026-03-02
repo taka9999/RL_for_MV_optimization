@@ -1,12 +1,12 @@
 {
   "mode": "true_params",
   "seed": 0,
-  "iters": 3000,
+  "iters": 2000,
   "Lambda": 0.1,
-  "alpha_theta": 1e-06,
-  "alpha_phi": 3e-05,
+  "alpha_theta": 1e-05,
+  "alpha_phi": 0.0001,
   "alpha_w": 0.01,
-  "omega_update_every": 10,
+  "omega_update_every": 20,
   "true_params": {
     "mu1": [
       0.25,

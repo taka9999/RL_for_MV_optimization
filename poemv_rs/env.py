@@ -16,20 +16,6 @@ class RSGBMParams:
     r: float = 0.0
 
 @dataclass
-class RSGBMParams2:
-    """Two-asset regime-switching GBM params.
-    mu1, mu2: shape (2,)
-    Sigma1, Sigma2: shape (2,2) covariance of log-returns per year
-    """
-    mu1: np.ndarray
-    mu2: np.ndarray
-    Sigma1: np.ndarray
-    Sigma2: np.ndarray
-    lam1: float = 0.36
-    lam2: float = 2.89
-    r: float = 0.0
-
-@dataclass
 class EpisodeConfig:
     T_years: float = 10.0
     dt: float = 1/252
@@ -141,3 +127,61 @@ def simulate_price_only(params: RSGBMParams, T_years: float, dt: float, s0: floa
         dlogS = (mu - 0.5*np.diag(Sigma))*dt + (L @ (np.sqrt(dt)*eps))
         S[k+1]=S[k]*np.exp(dlogS)
     return S, I
+
+class HistoricalLogReturnEnv:
+    """Replay environment driven by historical log-returns.
+
+    Inputs:
+      logret: np.ndarray shape (T, d), where logret[t] = log(S_{t+1}/S_t) for each asset.
+    Dynamics:
+      S_{t+1} = S_t * exp(logret_t)
+      r_t (simple) = exp(logret_t) - 1
+      X_{t+1} = X_t + u_t^T r_t
+    """
+    def __init__(self, logret: np.ndarray, dt: float, x0: float = 1.0, s0=None, seed: int = 0):
+        self.logret = np.asarray(logret, dtype=float)
+        if self.logret.ndim != 2:
+            raise ValueError("logret must be 2D (T,d)")
+        self.T, self.d = self.logret.shape
+        self.dt = float(dt)
+        self.rng = np.random.default_rng(seed)
+        if s0 is None:
+            self.s0 = np.ones(self.d, dtype=float)
+        else:
+            self.s0 = np.asarray(s0, dtype=float).reshape(self.d,)
+        self.x0 = float(x0)
+        self.reset(0)
+
+    @property
+    def n_steps(self) -> int:
+        return self.T
+
+    def reset(self, start_idx: int = 0):
+        if not (0 <= start_idx <= self.T):
+            raise ValueError("start_idx out of range")
+        self.start_idx = int(start_idx)
+        self.k = 0
+        self.t = 0.0
+        self.S = self.s0.copy()
+        self.X = self.x0
+        return self._obs()
+
+    def step(self, u: np.ndarray):
+        if self.k >= self.T:
+            return self._obs(), np.zeros(self.d), True
+        u = np.asarray(u, dtype=float).reshape(self.d,)
+        lr = self.logret[self.start_idx + self.k]  # (d,)
+        S_next = self.S * np.exp(lr)
+        ret = np.exp(lr) - 1.0                     # (d,)
+        X_next = self.X + float(np.dot(u, ret))
+        if not np.isfinite(X_next):
+            raise FloatingPointError(f"X_next non-finite: X={self.X}, u={u}, ret={ret}")
+        self.S = S_next
+        self.X = float(X_next)
+        self.k += 1
+        self.t += self.dt
+        done = (self.k >= self.T)
+        return self._obs(), ret, done
+
+    def _obs(self):
+        return {"t": self.t, "k": self.k, "S": self.S, "X": self.X}
