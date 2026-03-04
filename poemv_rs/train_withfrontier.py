@@ -41,38 +41,7 @@ def _weights_tangency(Sigma: np.ndarray, mu: np.ndarray) -> np.ndarray:
         return _weights_minvar(Sigma)
     return w / s
 
-def _weights_target_mean(Sigma: np.ndarray, mu: np.ndarray, m_target: float) -> np.ndarray:
-    """
-    Solve: min w^T Sigma w  s.t. 1^T w = 1,  mu^T w = m_target
-    Closed form: w = Sigma^{-1}(a*1 + b*mu), where [a,b] solves 2x2 system.
-    """
-    n = Sigma.shape[0]
-    one = np.ones(n)
-    #Sinv = np.linalg.inv(Sigma + 1e-12*np.eye(n))
-    #A = one @ (Sinv @ one)
-    #B = one @ (Sinv @ mu)
-    #C = mu  @ (Sinv @ mu)
-    Sigma_reg = Sigma + 1e-12*np.eye(n)
-    # x = Sigma^{-1} 1,  y = Sigma^{-1} mu  via solve
-    x = np.linalg.solve(Sigma_reg, one)
-    y = np.linalg.solve(Sigma_reg, mu)
-    A = float(one @ x)
-    B = float(one @ y)
-    C = float(mu  @ y)
-    det = A*C - B*B
-    if abs(det) < 1e-12:
-        # fallback (near-collinear): tangency or minvar
-        return _weights_tangency(Sigma, mu)
-    a = (C*1.0 - B*m_target) / det
-    b = (A*m_target - B*1.0) / det
-    #w = Sinv @ (a*one + b*mu)
-    # w = Sigma^{-1}(a*1 + b*mu) = a*x + b*y
-    w = a*x + b*y
-    return w
-
-def _backtest_monthly_MV_EW(logret_df_test: pd.DataFrame, lookback_days: int, mv_kind: str, x0: float = 1.0,
-                            target_mu: float | None = None,
-                            gross_lev_max: float | None = None):
+def _backtest_monthly_MV_EW(logret_df_test: pd.DataFrame, lookback_days: int, mv_kind: str, x0: float = 1.0):
     """
     Monthly rebalance at month start using rolling estimates from past lookback_days.
     Wealth: X_{t+1}=X_t + u^T r_t where r_t = exp(logret)-1, and u = w*X (fully invested).
@@ -100,21 +69,9 @@ def _backtest_monthly_MV_EW(logret_df_test: pd.DataFrame, lookback_days: int, mv
                 lr_hist = logret[start:t]
                 mu_hat = lr_hist.mean(axis=0)
                 Sigma_hat = np.cov(lr_hist.T, ddof=1)
-                if mv_kind == "tangency":
-                    w = _weights_tangency(Sigma_hat, mu_hat)
-                elif mv_kind == "target":
-                    if target_mu is None:
-                        raise ValueError("mv_kind='target' requires target_mu")
-                    w = _weights_target_mean(Sigma_hat, mu_hat, target_mu)
-                else:
-                    w = _weights_minvar(Sigma_hat)
+                w = _weights_tangency(Sigma_hat, mu_hat) if mv_kind == "tangency" else _weights_minvar(Sigma_hat)
             else:
                 w = np.ones(d) / d
-             # ---- gross leverage cap (important for MV(target)) ----
-            if (gross_lev_max is not None) and (gross_lev_max > 0):
-                lev = float(np.sum(np.abs(w)))
-                if lev > gross_lev_max:
-                    w = w * (gross_lev_max / lev)
             w_ew = np.ones(d) / d
             u_mv = w * X_mv[t]
             u_ew = w_ew * X_ew[t]
@@ -222,15 +179,12 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
           alpha_theta: float, alpha_phi: float, alpha_w: float,
           Lambda: float, omega_update_every: int,
           episode_T_years: float = 10.0, dt: float = 1/252, a_max: float = 2.0,
-          train_data_pkl: str | None = None,
-          test_data_pkl: str | None = None,
-          cols: list[str] | None = None,
+          data_pkl: str | None = None, cols: list[str] | None = None,
           train_start: str | None = None, train_end: str | None = None,
           test_start: str | None = None, test_end: str | None = None,
-          sim_test_seed: int | None = None,
           z_target: float = 1.5,
-          mv_target_mu: float | None = None
           ):
+
     set_seed(seed)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -240,8 +194,7 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         Sigma1=np.array([[0.22**2, 0.22*0.18*0.3],[0.22*0.18*0.3, 0.18**2]]),
         Sigma2=np.array([[0.22**2, 0.22*0.18*0.5],[0.22*0.18*0.5, 0.18**2]]),
         lam1=0.36, lam2=2.89, r=0.0)
-    use_hist_train = (train_data_pkl is not None)
-    use_hist_test  = (test_data_pkl is not None)
+    use_historical = (data_pkl is not None)
 
     if mode == "true_params":
         filt_params = FilterParams(mu1=true_params.mu1, mu2=true_params.mu2, Sigma1=true_params.Sigma1, Sigma2=true_params.Sigma2,
@@ -255,7 +208,7 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         raise ValueError("mode must be true_params or estimated_params")
 
      # demo plot for filtering (only for simulation mode)
-    if not use_hist_train:
+    if not use_historical:
         run_filter_demo(outdir, true_params=true_params, est_params=est_params, seed=seed)
 
     cfg = TrainConfig(T_years=episode_T_years, dt=dt, x0=1.0, s0=1.0, p0=0.5, z=float(z_target),
@@ -265,18 +218,17 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
     agent = POEMVAgent(cfg)
 
     # ----- historical data setup -----
-    df_train = None
-    df_test = None
-    logret_train = None
-    logret_test = None
-    if use_hist_train:
-        df_train = _load_logret_pkl(train_data_pkl, cols, train_start, train_end)
-        logret_train = df_train.values.astype(float)
+    if use_historical:
+        df_train = _load_logret_pkl(data_pkl, cols, train_start, train_end)
+        df_test  = _load_logret_pkl(data_pkl, cols, test_start, test_end)
+        logret_train = df_train.values.astype(float)  # (Ttr, d)
+        logret_test  = df_test.values.astype(float)   # (Tte, d)
+        d = logret_train.shape[1]
+        # if your policy/env are 2-asset fixed, enforce d=2
+        # assert d == 2
+        # optional: save which columns used
         with open(outdir/"historical_cols.txt","w",encoding="utf-8") as f:
             f.write(",".join(df_train.columns.tolist()))
-    if use_hist_test:
-        df_test = _load_logret_pkl(test_data_pkl, cols, test_start, test_end)
-        logret_test = df_test.values.astype(float)
 
     rows = []
     last_terminals = []
@@ -288,7 +240,7 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         # One episode:
         # - simulation: RSGBMEnv as before
         # - historical: sample a random window from train log-returns
-        if not use_hist_train:
+        if not use_historical:
             env = RSGBMEnv(true_params, EpisodeConfig(
                 T_years=episode_T_years, dt=dt, x0=cfg.x0, s0=cfg.s0, p0=cfg.p0,
                 a_max=a_max,
@@ -410,18 +362,8 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         if m % max(100, omega_update_every) == 0:
             pd.DataFrame(rows).to_csv(outdir/"metrics.csv", index=False)
     # ----- historical TEST backtest (deterministic mean action is recommended) -----
-    if use_hist_test:
-        eval_logret = logret_test
-        eval_df = df_test
-    else:
-        te_seed = (seed + 10_000) if sim_test_seed is None else int(sim_test_seed)
-        S_te, _ = simulate_price_only(true_params, T_years=episode_T_years, dt=dt, s0=1.0, seed=te_seed)
-        eval_logret = np.log(S_te[1:] / S_te[:-1])
-        idx = pd.date_range(start="2000-01-03", periods=len(eval_logret), freq="B")
-        eval_df = pd.DataFrame(eval_logret, index=idx)
-
-    if eval_logret is not None and (eval_logret.shape[0] > 5):
-        env_te = HistoricalLogReturnEnv(eval_logret, dt=dt, x0=cfg.x0, seed=seed+12345)
+    if use_historical and (logret_test.shape[0] > 5):
+        env_te = HistoricalLogReturnEnv(logret_test, dt=dt, x0=cfg.x0, seed=seed+12345)
         obs = env_te.reset(0)
         p = cfg.p0
         S_prev = obs["S"]
@@ -441,22 +383,18 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
                 break
         pd.DataFrame({"k": np.arange(len(X_path)), "X": X_path}).to_csv(outdir/"test_backtest_X.csv", index=False)
 
-        fig = plt.figure()
-        plt.plot(np.arange(len(X_path))*dt, X_path)
-        plt.xlabel("time (years)")
-        plt.ylabel("wealth X (test)")
-        fig.tight_layout()
-        fig.savefig(outdir/"test_backtest_X.png", dpi=200)
-        plt.close(fig)
+        #fig = plt.figure()
+        #plt.plot(np.arange(len(X_path))*dt, X_path)
+        #plt.xlabel("time (years)")
+        #plt.ylabel("wealth X (test)")
+        #fig.tight_layout()
+        #fig.savefig(outdir/"test_backtest_X.png", dpi=200)
+        #plt.close(fig)
         # --- Benchmarks: Monthly MV(minvar), MV(tangency), EW on the SAME test period ---
         # Use the same df_test that was loaded for test period (keeps dates).
-        lookback_days = 252
-        n_steps = int(round(episode_T_years / dt))
-        # default: align MV target to RL z via per-step mean log-return
-        target_mu_step = float(mv_target_mu) if mv_target_mu is not None else float(np.log(cfg.z / cfg.x0) / max(n_steps, 1))
-        dates_path, X_mv_minvar, X_ew = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="minvar", x0=cfg.x0)
-        _,          X_mv_tan,   _     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="tangency", x0=cfg.x0)
-        _,          X_mv_tgt,   _     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="target", x0=cfg.x0, target_mu=target_mu_step,gross_lev_max=1.5)
+        lookback_days = 252  # you can make this a CLI arg later
+        dates_path, X_mv_minvar, X_ew = _backtest_monthly_MV_EW(df_test, lookback_days=lookback_days, mv_kind="minvar", x0=cfg.x0)
+        _,          X_mv_tan,   _     = _backtest_monthly_MV_EW(df_test, lookback_days=lookback_days, mv_kind="tangency", x0=cfg.x0)
 
         # Save benchmark paths
         bench_df = pd.DataFrame({
@@ -464,7 +402,6 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             "X_RL": np.asarray(X_path, float),
             "X_MV_minvar": X_mv_minvar,
             "X_MV_tangency": X_mv_tan,
-            "X_MV_target": X_mv_tgt,
             "X_EW": X_ew,
         })
         bench_df.to_csv(outdir/"test_backtest_compare.csv", index=False)
@@ -475,7 +412,6 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         plt.plot(t_years, X_path, label="RL")
         plt.plot(t_years, X_mv_minvar, label="MV(minvar, monthly)")
         #plt.plot(t_years, X_mv_tan, label="MV(tangency, monthly)")
-        plt.plot(t_years, X_mv_tgt, label="MV(target, monthly)")
         plt.plot(t_years, X_ew, label="EW(monthly)")
         plt.xlabel("time (years)")
         plt.ylabel("wealth X (test)")
@@ -512,6 +448,8 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
                        true_params=true_params.__dict__, filter_params=filt_params.__dict__,
                        estimated_params=est_params.__dict__), f, indent=2, default=_json_default)
 
+    return agent, filt_params, (df_train if use_historical else None), (df_test if use_historical else None), true_params
+
 def _load_logret_pkl(pkl_path: str, cols: list[str] | None,
                      start: str | None, end: str | None) -> pd.DataFrame:
     df = pd.read_pickle(pkl_path)
@@ -544,35 +482,95 @@ def main():
     ap.add_argument("--T", type=float, default=10.0)
     ap.add_argument("--dt", type=float, default=1/252)
     ap.add_argument("--a_max", type=float, default=4.0)
-    # Backward compatible: --data_pkl sets BOTH train and test to historical
-    ap.add_argument("--data_pkl", type=str, default=None, help="(deprecated) Path to pkl for both train/test")
-    ap.add_argument("--train_data_pkl", type=str, default=None, help="Path to pkl of log returns for TRAIN")
-    ap.add_argument("--test_data_pkl", type=str, default=None, help="Path to pkl of log returns for TEST")
+    ap.add_argument("--data_pkl", type=str, default=None, help="Path to pkl of log returns (DataFrame)")
     ap.add_argument("--cols", type=str, default=None, help="Comma-separated column names, e.g., LargeCap,Gold")
     ap.add_argument("--train_start", type=str, default=None)
     ap.add_argument("--train_end", type=str, default=None)
     ap.add_argument("--test_start", type=str, default=None)
     ap.add_argument("--test_end", type=str, default=None)
-    ap.add_argument("--z", type=float, default=3.5)
-    ap.add_argument("--sim_test_seed", type=int, default=None, help="Seed for simulated TEST tape (if no test_data_pkl)")
-    ap.add_argument("--mv_target_mu", type=float, default=None,
-                    help="Target per-step mean log-return for MV(target). Default aligns with RL z: log(z/x0)/n_steps")
-
+    ap.add_argument("--z", type=float, default=1.5)
+    ap.add_argument("--frontier", action="store_true")
+    ap.add_argument("--z_list", type=str, default="1.05:1.55:0.05")
+    ap.add_argument("--n_eval", type=int, default=200)
+    ap.add_argument("--lookback_days", type=int, default=252)
     args = ap.parse_args()
     cols = None if args.cols is None else [c.strip() for c in args.cols.split(",") if c.strip()]
-    train_data_pkl = args.train_data_pkl
-    test_data_pkl = args.test_data_pkl
-    if args.data_pkl is not None:
-        train_data_pkl = args.data_pkl
-        test_data_pkl = args.data_pkl
-    train(args.mode, args.iters, args.seed, Path(args.outdir), args.alpha_theta, args.alpha_phi, args.alpha_w,
+    #train(args.mode, args.iters, args.seed, Path(args.outdir), args.alpha_theta, args.alpha_phi, args.alpha_w,
+    #      args.Lambda, args.omega_update_every, episode_T_years=args.T, dt=args.dt, a_max=args.a_max,
+    #      data_pkl=args.data_pkl, cols=cols,
+    #      train_start=args.train_start, train_end=args.train_end,
+    #      test_start=args.test_start, test_end=args.test_end
+    #      )
+    if not args.frontier:
+        train(args.mode, args.iters, args.seed, Path(args.outdir), args.alpha_theta, args.alpha_phi, args.alpha_w,
               args.Lambda, args.omega_update_every, episode_T_years=args.T, dt=args.dt, a_max=args.a_max,
-              train_data_pkl=train_data_pkl, test_data_pkl=test_data_pkl, cols=cols,
+              data_pkl=args.data_pkl, cols=cols,
               train_start=args.train_start, train_end=args.train_end,
               test_start=args.test_start, test_end=args.test_end,
-              sim_test_seed=args.sim_test_seed,
-              z_target=args.z,
-              mv_target_mu=args.mv_target_mu)
+              z_target=args.z)
+        return
+
+    # --- Frontier mode: loop over z_list, train+eval, save frontier_rl.csv/png ---
+    z_list = _parse_z_list(args.z_list)
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    frontier_rows = []
+
+    for z in z_list:
+        subdir = outdir / f"z_{z:.4f}"
+        agent, filt_params, df_train, df_test, true_params = train(
+            args.mode, args.iters, args.seed, subdir, args.alpha_theta, args.alpha_phi, args.alpha_w,
+            args.Lambda, args.omega_update_every, episode_T_years=args.T, dt=args.dt, a_max=args.a_max,
+            data_pkl=args.data_pkl, cols=cols,
+            train_start=args.train_start, train_end=args.train_end,
+            test_start=args.test_start, test_end=args.test_end,
+            z_target=float(z)
+        )
+
+        n_steps = int(round(args.T / args.dt))
+        # eval dataset:
+        if df_test is not None:
+            logret_eval = df_test.values.astype(float)
+            logret_df_eval = df_test
+        else:
+            # simulation: generate a long logret tape and sample windows from it
+            S, _ = simulate_price_only(true_params, T_years=max(30.0, args.T*5), dt=args.dt, s0=1.0, seed=args.seed+123)
+            logret_eval = np.log(S[1:] / S[:-1])
+            #logret_df_eval = pd.DataFrame(logret_eval)
+            # IMPORTANT: attach a datetime index so monthly rebalance works (otherwise falls back to EW)
+            idx = pd.date_range(start="2000-01-03", periods=len(logret_eval), freq="B")
+            logret_df_eval = pd.DataFrame(logret_eval, index=idx)
+
+        xT_rl = _eval_rl_on_env(agent, filt_params, logret_eval, dt=args.dt, n_steps=n_steps,
+                                a_max=args.a_max, n_eval=args.n_eval, seed0=args.seed+999)
+        m_rl = float(xT_rl.mean()); s_rl = float(xT_rl.std(ddof=1))
+
+        bench = _eval_bench_monthly_on_logret(logret_df_eval, dt=args.dt, n_steps=n_steps, n_eval=args.n_eval,
+                                              seed0=args.seed+1999, lookback_days=args.lookback_days)
+        frontier_rows.append({
+            "z": float(z),
+            "RL_mean": m_rl, "RL_std": s_rl,
+            "MV_minvar_mean": float(bench["MV_minvar"].mean()), "MV_minvar_std": float(bench["MV_minvar"].std(ddof=1)),
+            "MV_tangency_mean": float(bench["MV_tangency"].mean()), "MV_tangency_std": float(bench["MV_tangency"].std(ddof=1)),
+            "EW_mean": float(bench["EW"].mean()), "EW_std": float(bench["EW"].std(ddof=1)),
+        })
+
+    frontier = pd.DataFrame(frontier_rows)
+    frontier.to_csv(outdir/"frontier_rl.csv", index=False)
+
+    # plot: std on x, mean on y (classic frontier)
+    fig = plt.figure()
+    plt.plot(frontier["RL_std"], frontier["RL_mean"], marker="o", label="RL (vary z)")
+    # add benchmark reference points (use average across z; they don't depend on z structurally)
+    plt.scatter([frontier["MV_minvar_std"].mean()], [frontier["MV_minvar_mean"].mean()], label="MV(minvar, monthly)")
+    plt.scatter([frontier["MV_tangency_std"].mean()], [frontier["MV_tangency_mean"].mean()], label="MV(tangency, monthly)")
+    plt.scatter([frontier["EW_std"].mean()], [frontier["EW_mean"].mean()], label="EW(monthly)")
+    plt.xlabel("Std[X_T]")
+    plt.ylabel("E[X_T]")
+    plt.legend()
+    fig.tight_layout()
+    fig.savefig(outdir/"frontier.png", dpi=200)
+    plt.close(fig)
 
 if __name__ == "__main__":
     main()
