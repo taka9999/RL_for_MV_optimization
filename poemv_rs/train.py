@@ -72,7 +72,8 @@ def _weights_target_mean(Sigma: np.ndarray, mu: np.ndarray, m_target: float) -> 
 
 def _backtest_monthly_MV_EW(logret_df_test: pd.DataFrame, lookback_days: int, mv_kind: str, x0: float = 1.0,
                             target_mu: float | None = None,
-                            gross_lev_max: float | None = None):
+                            gross_lev_max: float | None = None,
+                            tcost: float = 0.0):
     """
     Monthly rebalance at month start using rolling estimates from past lookback_days.
     Wealth: X_{t+1}=X_t + u^T r_t where r_t = exp(logret)-1, and u = w*X (fully invested).
@@ -116,8 +117,17 @@ def _backtest_monthly_MV_EW(logret_df_test: pd.DataFrame, lookback_days: int, mv
                 if lev > gross_lev_max:
                     w = w * (gross_lev_max / lev)
             w_ew = np.ones(d) / d
-            u_mv = w * X_mv[t]
-            u_ew = w_ew * X_ew[t]
+            u_new_mv = w * X_mv[t]
+            u_new_ew = w_ew * X_ew[t]
+
+            # ---- transaction cost on rebalance: kappa * sum |Δu| ----
+            if tcost > 0:
+                X_mv[t] -= float(tcost * np.sum(np.abs(u_new_mv - u_mv)))
+                X_ew[t] -= float(tcost * np.sum(np.abs(u_new_ew - u_ew)))
+            u_mv = u_new_mv
+            u_ew = u_new_ew
+            #u_mv = w * X_mv[t]
+            #u_ew = w_ew * X_ew[t]
 
         X_mv[t+1] = X_mv[t] + float(u_mv @ ret[t])
         X_ew[t+1] = X_ew[t] + float(u_ew @ ret[t])
@@ -179,6 +189,59 @@ def _eval_bench_monthly_on_logret(logret_df: pd.DataFrame, dt: float, n_steps: i
     for k in out:
         out[k] = np.asarray(out[k], float)
     return out
+def _backtest_rl_on_logret(agent: POEMVAgent, filt_params: FilterParams,
+                           logret_df: pd.DataFrame, dt: float,
+                           rebalance: str = "daily",
+                           tcost: float = 0.0) -> tuple[pd.Index, np.ndarray]:
+    """
+    Backtest RL on a fixed logret_df window.
+    - rebalance="daily": update action every step
+    - rebalance="monthly": update action only at month start, hold u otherwise
+    Transaction cost: kappa * sum |Δu| charged when u is updated.
+    Returns: dates_path (T+1), X_path (T+1)
+    """
+    df = logret_df.copy().dropna(how="any")
+    dates = pd.to_datetime(df.index)
+    logret = df.values.astype(float)   # (T,d)
+    ret = np.exp(logret) - 1.0
+    T, d = logret.shape
+
+    month = dates.to_period("M")
+    is_month_start = np.zeros(T, dtype=bool)
+    is_month_start[0] = True
+    is_month_start[1:] = (month[1:] != month[:-1])
+
+    # price path used only for filtering
+    S = np.ones(d, dtype=float)
+    p = float(agent.cfg.p0)
+
+    X = np.empty(T+1, dtype=float)
+    X[0] = float(agent.cfg.x0)
+    u_prev = np.zeros(d, dtype=float)
+    u = np.zeros(d, dtype=float)
+
+    for t in range(T):
+        do_trade = (rebalance == "daily") or (rebalance == "monthly" and is_month_start[t])
+        if do_trade:
+            u_new, _, _ = agent.act(t*dt, float(X[t]), p)
+            u_new = np.asarray(u_new, float).reshape(d,)
+            if tcost > 0:
+                X[t] -= float(tcost * np.sum(np.abs(u_new - u_prev)))
+            u_prev = u_new
+            u = u_new
+
+        # wealth update
+        X[t+1] = X[t] + float(u @ ret[t])
+
+        # filtering update (using prices)
+        S_next = S * np.exp(logret[t])
+        lr = np.log(S_next / S)
+        p, _ = wonham_filter_q_update(p, lr, dt, filt_params)
+        p = safe_clip_p(p)
+        S = S_next
+
+    dates_path = pd.Index(dates).insert(0, dates[0] - pd.Timedelta(days=1))
+    return dates_path, X
 
 def run_filter_demo(outdir: Path, true_params: RSGBMParams, est_params: RSGBMParams, T_years=10.0, dt=1/252, seed=0):
     S, I = simulate_price_only(true_params, T_years=T_years, dt=dt, s0=1.0, seed=seed)
@@ -229,7 +292,8 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
           test_start: str | None = None, test_end: str | None = None,
           sim_test_seed: int | None = None,
           z_target: float = 1.5,
-          mv_target_mu: float | None = None
+          mv_target_mu: float | None = None,
+          tcost: float = 0.0
           ):
     set_seed(seed)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -421,47 +485,67 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         eval_df = pd.DataFrame(eval_logret, index=idx)
 
     if eval_logret is not None and (eval_logret.shape[0] > 5):
-        env_te = HistoricalLogReturnEnv(eval_logret, dt=dt, x0=cfg.x0, seed=seed+12345)
-        obs = env_te.reset(0)
-        p = cfg.p0
-        S_prev = obs["S"]
-        X_path = [obs["X"]]
-        for k in range(env_te.n_steps):
-            # stochastic action:
-            # u, _, _ = agent.act(k*dt, obs["X"], p)            # deterministic center (if you added agent.mean_action):
-            u, _, _ = agent.act(k*dt, obs["X"], p)
-            obs, _, done = env_te.step(u)
-            S_now = obs["S"]
-            log_return = np.log(S_now / S_prev)
-            p, _ = wonham_filter_q_update(p, log_return, dt, filt_params)
-            p = safe_clip_p(p)
-            S_prev = S_now
-            X_path.append(obs["X"])
-            if done:
-                break
-        pd.DataFrame({"k": np.arange(len(X_path)), "X": X_path}).to_csv(outdir/"test_backtest_X.csv", index=False)
+        #env_te = HistoricalLogReturnEnv(eval_logret, dt=dt, x0=cfg.x0, seed=seed+12345)
+        #obs = env_te.reset(0)
+        #p = cfg.p0
+        #S_prev = obs["S"]
+        #X_path = [obs["X"]]
+        #for k in range(env_te.n_steps):
+        #    # stochastic action:
+        #    # u, _, _ = agent.act(k*dt, obs["X"], p)            # deterministic center (if you added agent.mean_action):
+        #    u, _, _ = agent.act(k*dt, obs["X"], p)
+        #    obs, _, done = env_te.step(u)
+        #    S_now = obs["S"]
+        #    log_return = np.log(S_now / S_prev)
+        #    p, _ = wonham_filter_q_update(p, log_return, dt, filt_params)
+        #    p = safe_clip_p(p)
+        #    S_prev = S_now
+        #    X_path.append(obs["X"])
+        #    if done:
+        #        break
+        #pd.DataFrame({"k": np.arange(len(X_path)), "X": X_path}).to_csv(outdir/"test_backtest_X.csv", index=False)
+        # RL backtest on the whole eval_df (same period used by MV/EW)
+        # NOTE: we will output BOTH daily-rebalance and monthly-rebalance RL paths.
+        # Transaction cost is applied on action updates: kappa * sum |Δu|.
+        dates_path, X_rl_daily = _backtest_rl_on_logret(agent, filt_params, eval_df, dt=dt, rebalance="daily", tcost=tcost)
+        _,          X_rl_month = _backtest_rl_on_logret(agent, filt_params, eval_df, dt=dt, rebalance="monthly", tcost=tcost)
 
-        fig = plt.figure()
-        plt.plot(np.arange(len(X_path))*dt, X_path)
-        plt.xlabel("time (years)")
-        plt.ylabel("wealth X (test)")
-        fig.tight_layout()
-        fig.savefig(outdir/"test_backtest_X.png", dpi=200)
-        plt.close(fig)
+        pd.DataFrame({"date": dates_path.astype(str), "X_RL_daily": X_rl_daily, "X_RL_monthly": X_rl_month}).to_csv(
+            outdir/"test_backtest_X.csv", index=False
+        )
+
+        #fig = plt.figure()
+        #plt.plot(np.arange(len(X_path))*dt, X_path)
+        #plt.xlabel("time (years)")
+        #plt.ylabel("wealth X (test)")
+        #fig.tight_layout()
+        #fig.savefig(outdir/"test_backtest_X.png", dpi=200)
+        #plt.close(fig)
+        
         # --- Benchmarks: Monthly MV(minvar), MV(tangency), EW on the SAME test period ---
         # Use the same df_test that was loaded for test period (keeps dates).
         lookback_days = 252
         n_steps = int(round(episode_T_years / dt))
         # default: align MV target to RL z via per-step mean log-return
+        #target_mu_step = float(mv_target_mu) if mv_target_mu is not None else float(np.log(cfg.z / cfg.x0) / max(n_steps, 1))
+        #dates_path, X_mv_minvar, X_ew = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="minvar", x0=cfg.x0)
+        #_,          X_mv_tan,   _     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="tangency", x0=cfg.x0)
+        #_,          X_mv_tgt,   _     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="target", x0=cfg.x0, target_mu=target_mu_step,gross_lev_max=1.5)
         target_mu_step = float(mv_target_mu) if mv_target_mu is not None else float(np.log(cfg.z / cfg.x0) / max(n_steps, 1))
-        dates_path, X_mv_minvar, X_ew = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="minvar", x0=cfg.x0)
-        _,          X_mv_tan,   _     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="tangency", x0=cfg.x0)
-        _,          X_mv_tgt,   _     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="target", x0=cfg.x0, target_mu=target_mu_step,gross_lev_max=1.5)
+        dates_path, X_mv_minvar, X_ew = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="minvar",
+                                                                x0=cfg.x0, tcost=tcost)
+        _,          X_mv_tan,   _     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="tangency",
+                                                                x0=cfg.x0, tcost=tcost)
+        _,          X_mv_tgt,   _     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="target",
+                                                                x0=cfg.x0, target_mu=target_mu_step, gross_lev_max=1.5, tcost=tcost)
+
 
         # Save benchmark paths
         bench_df = pd.DataFrame({
             "date": dates_path.astype(str),
-            "X_RL": np.asarray(X_path, float),
+            "X_RL_daily": X_rl_daily,
+            "X_RL_monthly": X_rl_month,
+            #"X_RL": np.asarray(X_path, float),
             "X_MV_minvar": X_mv_minvar,
             "X_MV_tangency": X_mv_tan,
             "X_MV_target": X_mv_tgt,
@@ -471,8 +555,11 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
 
         # Plot all on one figure
         fig = plt.figure()
-        t_years = np.arange(len(X_path)) * dt
-        plt.plot(t_years, X_path, label="RL")
+        #t_years = np.arange(len(X_path)) * dt
+        #plt.plot(t_years, X_path, label="RL")
+        t_years = np.arange(len(X_rl_daily)) * dt
+        plt.plot(t_years, X_rl_daily, label="RL(daily)")
+        plt.plot(t_years, X_rl_month, label="RL(monthly)")
         plt.plot(t_years, X_mv_minvar, label="MV(minvar, monthly)")
         #plt.plot(t_years, X_mv_tan, label="MV(tangency, monthly)")
         plt.plot(t_years, X_mv_tgt, label="MV(target, monthly)")
@@ -557,6 +644,8 @@ def main():
     ap.add_argument("--sim_test_seed", type=int, default=None, help="Seed for simulated TEST tape (if no test_data_pkl)")
     ap.add_argument("--mv_target_mu", type=float, default=None,
                     help="Target per-step mean log-return for MV(target). Default aligns with RL z: log(z/x0)/n_steps")
+    ap.add_argument("--tcost", type=float, default=0.0,
+                    help="Proportional transaction cost kappa charged on rebalance: kappa * sum |Δu| (dollar turnover). Example: 0.0005 (5bps)")
 
     args = ap.parse_args()
     cols = None if args.cols is None else [c.strip() for c in args.cols.split(",") if c.strip()]
@@ -572,7 +661,8 @@ def main():
               test_start=args.test_start, test_end=args.test_end,
               sim_test_seed=args.sim_test_seed,
               z_target=args.z,
-              mv_target_mu=args.mv_target_mu)
+              mv_target_mu=args.mv_target_mu,
+              tcost=args.tcost)
 
 if __name__ == "__main__":
     main()
