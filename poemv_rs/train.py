@@ -5,6 +5,8 @@ import pandas as pd
 import math
 from pathlib import Path
 import matplotlib.pyplot as plt
+import torch
+import torch.optim as optim
 
 from .env import RSGBMParams,EpisodeConfig, RSGBMEnv,simulate_price_only,HistoricalLogReturnEnv
 from .filtering import FilterParams, wonham_filter_q_update
@@ -92,6 +94,8 @@ def _backtest_monthly_MV_EW(logret_df_test: pd.DataFrame, lookback_days: int, mv
 
     X_mv = np.empty(T+1); X_ew = np.empty(T+1)
     X_mv[0] = x0; X_ew[0] = x0
+    gross_mv = np.empty(T+1); gross_ew = np.empty(T+1)
+    gross_mv[0] = 0.0; gross_ew[0] = 0.0
     u_mv = np.zeros(d); u_ew = np.zeros(d)
 
     for t in range(T):
@@ -131,11 +135,14 @@ def _backtest_monthly_MV_EW(logret_df_test: pd.DataFrame, lookback_days: int, mv
 
         X_mv[t+1] = X_mv[t] + float(u_mv @ ret[t])
         X_ew[t+1] = X_ew[t] + float(u_ew @ ret[t])
+        denom_mv = X_mv[t+1] if abs(X_mv[t+1]) > 1e-12 else 1e-12
+        denom_ew = X_ew[t+1] if abs(X_ew[t+1]) > 1e-12 else 1e-12
+        gross_mv[t+1] = float(np.sum(np.abs(u_mv / denom_mv)))
+        gross_ew[t+1] = float(np.sum(np.abs(u_ew / denom_ew)))
 
     # create a (T+1,) time index for plotting
     dates_path = pd.Index(dates).insert(0, dates[0] - pd.Timedelta(days=1))
-    return dates_path, X_mv, X_ew
-
+    return dates_path, X_mv, X_ew, gross_mv, gross_ew
 def _eval_rl_on_env(agent: POEMVAgent, filt_params: FilterParams, logret: np.ndarray, dt: float,
                     n_steps: int, a_max: float, n_eval: int, seed0: int):
     """Evaluate RL on either simulated (logret generated outside) or historical (given logret).
@@ -192,7 +199,8 @@ def _eval_bench_monthly_on_logret(logret_df: pd.DataFrame, dt: float, n_steps: i
 def _backtest_rl_on_logret(agent: POEMVAgent, filt_params: FilterParams,
                            logret_df: pd.DataFrame, dt: float,
                            rebalance: str = "daily",
-                           tcost: float = 0.0) -> tuple[pd.Index, np.ndarray]:
+                           tcost: float = 0.0,
+                           gross_lev_max: float | None = None):
     """
     Backtest RL on a fixed logret_df window.
     - rebalance="daily": update action every step
@@ -217,6 +225,8 @@ def _backtest_rl_on_logret(agent: POEMVAgent, filt_params: FilterParams,
 
     X = np.empty(T+1, dtype=float)
     X[0] = float(agent.cfg.x0)
+    gross = np.empty(T+1, dtype=float)
+    gross[0] = 0.0
     u_prev = np.zeros(d, dtype=float)
     u = np.zeros(d, dtype=float)
 
@@ -225,6 +235,13 @@ def _backtest_rl_on_logret(agent: POEMVAgent, filt_params: FilterParams,
         if do_trade:
             u_new, _, _ = agent.act(t*dt, float(X[t]), p)
             u_new = np.asarray(u_new, float).reshape(d,)
+            # Optional gross leverage cap: sum_i |w_i| <= gross_lev_max
+            # where w = u / X at the trade time.
+            if (gross_lev_max is not None) and (gross_lev_max > 0):
+                denom = X[t] if abs(X[t]) > 1e-12 else 1e-12
+                lev = float(np.sum(np.abs(u_new / denom)))
+                if lev > gross_lev_max:
+                    u_new = u_new * (gross_lev_max / lev)
             if tcost > 0:
                 X[t] -= float(tcost * np.sum(np.abs(u_new - u_prev)))
             u_prev = u_new
@@ -232,6 +249,9 @@ def _backtest_rl_on_logret(agent: POEMVAgent, filt_params: FilterParams,
 
         # wealth update
         X[t+1] = X[t] + float(u @ ret[t])
+        # gross leverage at end-of-day (based on current holdings u and wealth X[t+1])
+        denom = X[t+1] if abs(X[t+1]) > 1e-12 else 1e-12
+        gross[t+1] = float(np.sum(np.abs(u / denom)))
 
         # filtering update (using prices)
         S_next = S * np.exp(logret[t])
@@ -241,7 +261,7 @@ def _backtest_rl_on_logret(agent: POEMVAgent, filt_params: FilterParams,
         S = S_next
 
     dates_path = pd.Index(dates).insert(0, dates[0] - pd.Timedelta(days=1))
-    return dates_path, X
+    return dates_path, X, gross
 
 def run_filter_demo(outdir: Path, true_params: RSGBMParams, est_params: RSGBMParams, T_years=10.0, dt=1/252, seed=0):
     S, I = simulate_price_only(true_params, T_years=T_years, dt=dt, s0=1.0, seed=seed)
@@ -281,6 +301,211 @@ def make_estimated_params_via_heuristic(true_params: RSGBMParams, seed=0):
     est = estimate_env_params_from_labeled_returns(ret_train, reg, dt=dt)
     return RSGBMParams(**est, r=true_params.r)
 
+def _export_center_wstar_p(agent: POEMVAgent, out_path: Path, p_bins: int = 99, t0: float = 0.0, x0: float = 1.0):
+    """
+    Export center w*(p) computed from deterministic mean action:
+      a*(p) = agent.mean_action(t0, x0, p)
+      w*(p) = a*(p) / x0
+    Saved as .npz: p_grid (G,), w_star (G,d)
+    """
+    p_grid = np.linspace(0.01, 0.99, int(p_bins))
+    ws = []
+    for p in p_grid:
+        a = agent.mean_action(t0, x0, float(p))  # (d,)
+        w = np.asarray(a, float) / float(x0)
+        ws.append(w)
+    w_star = np.stack(ws, axis=0)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(out_path, p_grid=p_grid, w_star=w_star)
+
+def _load_center_wstar(path: Path):
+    z = np.load(path, allow_pickle=False)
+    return z["p_grid"].astype(float), z["w_star"].astype(float)
+
+def _interp_wstar(p: float, p_grid: np.ndarray, w_star: np.ndarray) -> np.ndarray:
+    # linear interpolation in p (w_star: (G,d))
+    p = float(np.clip(p, p_grid[0], p_grid[-1]))
+    j = int(np.searchsorted(p_grid, p))
+    if j <= 0:
+        return w_star[0].copy()
+    if j >= len(p_grid):
+        return w_star[-1].copy()
+    p0, p1 = p_grid[j-1], p_grid[j]
+    a = (p - p0) / (p1 - p0 + 1e-12)
+    return (1-a)*w_star[j-1] + a*w_star[j]
+
+def _backtest_band_on_logret(logret_df: pd.DataFrame,
+                             filt_params: FilterParams,
+                             p_grid: np.ndarray, w_star_grid: np.ndarray,
+                             delta: np.ndarray,
+                             dt: float,
+                             x0: float = 1.0,
+                             tcost: float = 0.0,
+                             gross_lev_max: float | None = None):
+    """
+    Band (width-only, projection) backtest.
+    State uses p_t (Wonham filter on observed logret).
+    Holdings stored as dollar position u. Weight is w=u/X.
+    Rule:
+      if |w - w*| <= delta : no trade
+      else : project to boundary: w_new = w* + clip(w-w*, -delta, +delta)
+    Cost on trade: kappa * sum |Δu|.
+    """
+    df = logret_df.copy().dropna(how="any")
+    dates = pd.to_datetime(df.index)
+    logret = df.values.astype(float)   # (T,d)
+    ret = np.exp(logret) - 1.0
+    T, d = logret.shape
+    delta = np.asarray(delta, float).reshape(d,)
+
+    X = np.empty(T+1, dtype=float)
+    X[0] = float(x0)
+    gross = np.empty(T+1, dtype=float)
+    gross[0] = 0.0
+    u = np.zeros(d, dtype=float)
+
+    # price for filtering
+    S = np.ones(d, dtype=float)
+    p = 0.5
+
+    for t in range(T):
+        # current weights
+        w = (u / X[t]) if abs(X[t]) > 1e-12 else np.zeros(d)
+        w_star = _interp_wstar(p, p_grid, w_star_grid)
+        # check band
+        dev = w - w_star
+        inside = np.all(np.abs(dev) <= delta)
+        if not inside:
+            w_new = w_star + np.clip(dev, -delta, +delta)
+            if (gross_lev_max is not None) and (gross_lev_max > 0):
+                lev = float(np.sum(np.abs(w_new)))
+                if lev > gross_lev_max:
+                    w_new = w_new * (gross_lev_max / lev)
+            u_new = w_new * X[t]
+            if tcost > 0:
+                X[t] -= float(tcost * np.sum(np.abs(u_new - u)))
+            u = u_new
+
+        # wealth update
+        X[t+1] = X[t] + float(u @ ret[t])
+        denom = X[t+1] if abs(X[t+1]) > 1e-12 else 1e-12
+        gross[t+1] = float(np.sum(np.abs(u / denom)))
+
+        # filter update
+        S_next = S * np.exp(logret[t])
+        lr = np.log(S_next / S)
+        p, _ = wonham_filter_q_update(p, lr, dt, filt_params)
+        p = safe_clip_p(p)
+        S = S_next
+
+    dates_path = pd.Index(dates).insert(0, dates[0] - pd.Timedelta(days=1))
+    return dates_path, X, gross
+
+def _train_band_delta(logret_train_df: pd.DataFrame,
+                      filt_params: FilterParams,
+                      p_grid: np.ndarray, w_star_grid: np.ndarray,
+                      dt: float, T_years: float,
+                      z_target: float,
+                      iters: int,
+                      tcost: float,
+                      delta_init: float,
+                      lr: float,
+                      gross_lev_max: float | None,
+                      seed: int,
+                      outdir: Path):
+    """
+    Learn band width delta (per-asset) under transaction costs.
+    Center w*(p) fixed.
+    Objective: maximize quadratic terminal utility h(X_T) with dual omega (same as RL style).
+    We do simple stochastic gradient on delta via reparameterization:
+      delta = softplus(theta)   (theta trainable)
+    We estimate gradient through Monte Carlo episodes using torch autograd by simulating band updates in torch.
+    (This is a minimal, stable learner for width-only.)
+    """
+    df = logret_train_df.copy().dropna(how="any")
+    logret_all = df.values.astype(np.float64)
+    T_all, d = logret_all.shape
+    n_steps = int(round(T_years / dt))
+    if T_all <= n_steps + 5:
+        raise ValueError("train data too short for band training episode length")
+
+    rng = np.random.default_rng(seed)
+    device = torch.device("cpu")
+    theta = torch.nn.Parameter(torch.full((d,), float(delta_init), dtype=torch.float64, device=device))
+    opt = optim.Adam([theta], lr=float(lr))
+
+    omega = torch.tensor(0.0, dtype=torch.float64, device=device)
+    alpha_w = 1e-2  # keep simple; can expose if needed
+
+    rows = []
+    for it in range(1, iters+1):
+        start = int(rng.integers(0, T_all - n_steps))
+        logret = torch.tensor(logret_all[start:start+n_steps], dtype=torch.float64, device=device)  # (n,d)
+        ret = torch.exp(logret) - 1.0
+
+        delta = torch.nn.functional.softplus(theta)  # (d,) positive
+        # Use scalar state x (no in-place writes on a tensor needed for autograd)
+        x = torch.tensor(1.0, dtype=torch.float64, device=device)        
+        u = torch.zeros(d, dtype=torch.float64, device=device)
+        S = torch.ones(d, dtype=torch.float64, device=device)
+        p = 0.5
+
+        # pre-load numpy for filter to keep it minimal (filter is scalar anyway)
+        for t in range(n_steps):
+            # weights
+            w = u / (x + 1e-12)
+            w_star = torch.tensor(_interp_wstar(p, p_grid, w_star_grid), dtype=torch.float64, device=device)
+            dev = w - w_star
+            inside = torch.all(torch.abs(dev) <= delta)
+            if not bool(inside.item()):
+                w_new = w_star + torch.clamp(dev, -delta, +delta)
+                if (gross_lev_max is not None) and (gross_lev_max > 0):
+                    lev = torch.sum(torch.abs(w_new))
+                    w_new = torch.where(lev > gross_lev_max, w_new * (gross_lev_max / (lev + 1e-12)), w_new)
+                u_new = w_new * x
+                if tcost > 0:
+                    x = x - float(tcost) * torch.sum(torch.abs(u_new - u))
+                u = u_new
+            # wealth update (no in-place)
+            x = x + torch.dot(u, ret[t])
+
+            # filter update (numpy)
+            S_next = (S * torch.exp(logret[t])).detach().cpu().numpy()
+            lr_np = np.log(S_next / S.detach().cpu().numpy())
+            p, _ = wonham_filter_q_update(p, lr_np, dt, filt_params)
+            p = float(safe_clip_p(p))
+            S = torch.tensor(S_next, dtype=torch.float64, device=device)
+
+        xT = x
+        # quadratic terminal utility (same shape as your RL): h = (xT-omega)^2 - (omega-z)^2
+        h = (xT - omega)**2 - (omega - float(z_target))**2
+        # maximize h => minimize -h
+        loss = -h
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        # dual ascent for omega to meet mean target (very rough but works as a stabilizer)
+        with torch.no_grad():
+            omega = omega + alpha_w * (xT.detach() - float(z_target))
+
+        if (it % 50) == 0 or it == 1:
+            rows.append({
+                "iter": it,
+                "loss": float(loss.detach().cpu()),
+                "xT": float(xT.detach().cpu()),
+                "omega": float(omega.detach().cpu()),
+                "delta_mean": float(delta.detach().mean().cpu()),
+                "delta": delta.detach().cpu().numpy().tolist(),
+            })
+            pd.DataFrame(rows).to_csv(outdir/"band_train_metrics.csv", index=False)
+
+    # final save
+    delta_final = torch.nn.functional.softplus(theta).detach().cpu().numpy()
+    np.savez(outdir/"band_delta.npz", delta=delta_final)
+    return delta_final
+
 def train(mode: str, iters: int, seed: int, outdir: Path,
           alpha_theta: float, alpha_phi: float, alpha_w: float,
           Lambda: float, omega_update_every: int,
@@ -293,7 +518,20 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
           sim_test_seed: int | None = None,
           z_target: float = 1.5,
           mv_target_mu: float | None = None,
-          tcost: float = 0.0
+          rl_gross_lev_max: float | None = None,
+          tcost: float = 0.0,
+          export_center: bool = False,
+          center_bins: int = 99,
+          center_path: str | None = None,
+          band_overlay: bool = False,
+          band_delta: float = 0.05,
+          band_tcost: float = 0.0,
+          band_gross_lev_max: float | None = None,
+          band_train: bool = False,
+          band_train_iters: int = 300,
+          band_train_lr: float = 3e-3,
+          band_delta_init: float = 0.05,
+          
           ):
     set_seed(seed)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -485,58 +723,32 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         eval_df = pd.DataFrame(eval_logret, index=idx)
 
     if eval_logret is not None and (eval_logret.shape[0] > 5):
-        #env_te = HistoricalLogReturnEnv(eval_logret, dt=dt, x0=cfg.x0, seed=seed+12345)
-        #obs = env_te.reset(0)
-        #p = cfg.p0
-        #S_prev = obs["S"]
-        #X_path = [obs["X"]]
-        #for k in range(env_te.n_steps):
-        #    # stochastic action:
-        #    # u, _, _ = agent.act(k*dt, obs["X"], p)            # deterministic center (if you added agent.mean_action):
-        #    u, _, _ = agent.act(k*dt, obs["X"], p)
-        #    obs, _, done = env_te.step(u)
-        #    S_now = obs["S"]
-        #    log_return = np.log(S_now / S_prev)
-        #    p, _ = wonham_filter_q_update(p, log_return, dt, filt_params)
-        #    p = safe_clip_p(p)
-        #    S_prev = S_now
-        #    X_path.append(obs["X"])
-        #    if done:
-        #        break
-        #pd.DataFrame({"k": np.arange(len(X_path)), "X": X_path}).to_csv(outdir/"test_backtest_X.csv", index=False)
+        # (1) export center w*(p) after training (cost-free center)
+        if export_center:
+            cpath = Path(center_path) if center_path is not None else (outdir/"center_wstar.npz")
+            _export_center_wstar_p(agent, cpath, p_bins=int(center_bins), t0=0.0, x0=1.0)
+
         # RL backtest on the whole eval_df (same period used by MV/EW)
         # NOTE: we will output BOTH daily-rebalance and monthly-rebalance RL paths.
         # Transaction cost is applied on action updates: kappa * sum |Δu|.
-        dates_path, X_rl_daily = _backtest_rl_on_logret(agent, filt_params, eval_df, dt=dt, rebalance="daily", tcost=tcost)
-        _,          X_rl_month = _backtest_rl_on_logret(agent, filt_params, eval_df, dt=dt, rebalance="monthly", tcost=tcost)
+        dates_path, X_rl_daily, gross_rl_daily = _backtest_rl_on_logret(agent, filt_params, eval_df, dt=dt, rebalance="daily", tcost=tcost,gross_lev_max=rl_gross_lev_max)
+        _,          X_rl_month, gross_rl_month = _backtest_rl_on_logret(agent, filt_params, eval_df, dt=dt, rebalance="monthly", tcost=tcost,gross_lev_max=rl_gross_lev_max)
 
         pd.DataFrame({"date": dates_path.astype(str), "X_RL_daily": X_rl_daily, "X_RL_monthly": X_rl_month}).to_csv(
             outdir/"test_backtest_X.csv", index=False
         )
-
-        #fig = plt.figure()
-        #plt.plot(np.arange(len(X_path))*dt, X_path)
-        #plt.xlabel("time (years)")
-        #plt.ylabel("wealth X (test)")
-        #fig.tight_layout()
-        #fig.savefig(outdir/"test_backtest_X.png", dpi=200)
-        #plt.close(fig)
         
         # --- Benchmarks: Monthly MV(minvar), MV(tangency), EW on the SAME test period ---
         # Use the same df_test that was loaded for test period (keeps dates).
         lookback_days = 252
         n_steps = int(round(episode_T_years / dt))
-        # default: align MV target to RL z via per-step mean log-return
-        #target_mu_step = float(mv_target_mu) if mv_target_mu is not None else float(np.log(cfg.z / cfg.x0) / max(n_steps, 1))
-        #dates_path, X_mv_minvar, X_ew = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="minvar", x0=cfg.x0)
-        #_,          X_mv_tan,   _     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="tangency", x0=cfg.x0)
-        #_,          X_mv_tgt,   _     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="target", x0=cfg.x0, target_mu=target_mu_step,gross_lev_max=1.5)
+
         target_mu_step = float(mv_target_mu) if mv_target_mu is not None else float(np.log(cfg.z / cfg.x0) / max(n_steps, 1))
-        dates_path, X_mv_minvar, X_ew = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="minvar",
+        dates_path, X_mv_minvar, X_ew, gross_mv_minvar, gross_ew = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="minvar",
                                                                 x0=cfg.x0, tcost=tcost)
-        _,          X_mv_tan,   _     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="tangency",
+        _, X_mv_tan, _Xew2, gross_mv_tan, _gross_ew2     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="tangency",
                                                                 x0=cfg.x0, tcost=tcost)
-        _,          X_mv_tgt,   _     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="target",
+        _, X_mv_tgt, _Xew3, gross_mv_tgt, _gross_ew3     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="target",
                                                                 x0=cfg.x0, target_mu=target_mu_step, gross_lev_max=1.5, tcost=tcost)
 
 
@@ -550,8 +762,62 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             "X_MV_tangency": X_mv_tan,
             "X_MV_target": X_mv_tgt,
             "X_EW": X_ew,
+             "gross_RL_daily": gross_rl_daily,
+            "gross_RL_monthly": gross_rl_month,
+            "gross_MV_minvar": gross_mv_minvar,
+            "gross_MV_tangency": gross_mv_tan,
+            "gross_MV_target": gross_mv_tgt,
+            "gross_EW": gross_ew,
         })
+        # (2) band overlay (width-only projection) on the same test tape
+        if band_overlay:
+            cpath = Path(center_path) if center_path is not None else (outdir/"center_wstar.npz")
+            if not cpath.exists():
+                # if center wasn't exported yet, export now
+                _export_center_wstar_p(agent, cpath, p_bins=int(center_bins), t0=0.0, x0=1.0)
+            p_grid, w_star_grid = _load_center_wstar(cpath)
+            # delta can be learned delta file
+            delta_vec = np.full((eval_df.shape[1],), float(band_delta), dtype=float)
+            # if band training produced band_delta.npz, prefer it
+            learned = outdir/"band_delta.npz"
+            if learned.exists():
+                try:
+                    delta_vec = np.load(learned)["delta"].astype(float).reshape(-1,)
+                except Exception:
+                    pass
+            _, X_band, gross_band = _backtest_band_on_logret(
+                eval_df, filt_params, p_grid, w_star_grid,
+                delta=delta_vec, dt=dt, x0=cfg.x0,
+                tcost=float(band_tcost),
+                gross_lev_max=band_gross_lev_max
+            )
+            bench_df["X_BAND"] = X_band
+            bench_df["gross_BAND"] = gross_band
         bench_df.to_csv(outdir/"test_backtest_compare.csv", index=False)
+        # --- gross leverage time-series plot (separate png, no subplots) ---
+        fig = plt.figure()
+        t_years = np.arange(len(bench_df)) * dt
+
+        def _plot_if(col: str, label: str):
+            if col in bench_df.columns:
+                y = bench_df[col].values.astype(float)
+                if np.all(np.isfinite(y)):
+                    plt.plot(t_years, y, label=label)
+
+        _plot_if("gross_RL_daily",   "RL(daily)")
+        _plot_if("gross_RL_monthly", "RL(monthly)")
+        _plot_if("gross_MV_minvar",  "MV(minvar, monthly)")
+        #_plot_if("gross_MV_tangency","MV(tangency, monthly)")
+        _plot_if("gross_MV_target",  "MV(target, monthly)")
+        _plot_if("gross_EW",         "EW(monthly)")
+        _plot_if("gross_BAND",       "BAND(width-only)")
+
+        plt.xlabel("time (years)")
+        plt.ylabel("gross leverage (sum |w|)")
+        plt.legend()
+        fig.tight_layout()
+        fig.savefig(outdir/"gross_leverage_compare.png", dpi=200)
+        plt.close(fig)
 
         # Plot all on one figure
         fig = plt.figure()
@@ -564,12 +830,57 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         #plt.plot(t_years, X_mv_tan, label="MV(tangency, monthly)")
         plt.plot(t_years, X_mv_tgt, label="MV(target, monthly)")
         plt.plot(t_years, X_ew, label="EW(monthly)")
+        if "X_BAND" in bench_df.columns:
+            plt.plot(t_years, bench_df["X_BAND"].values, label="BAND(width-only)")
         plt.xlabel("time (years)")
         plt.ylabel("wealth X (test)")
         plt.legend()
         fig.tight_layout()
         fig.savefig(outdir/"test_backtest_compare.png", dpi=200)
         plt.close(fig)
+
+        # (3) band learning under transaction cost on TRAIN tape (center fixed)
+        if band_train:
+            if df_train is None:
+                raise ValueError("band_train requires historical train_data_pkl (df_train) in current minimal implementation")
+            cpath = Path(center_path) if center_path is not None else (outdir/"center_wstar.npz")
+            if not cpath.exists():
+                _export_center_wstar_p(agent, cpath, p_bins=int(center_bins), t0=0.0, x0=1.0)
+            p_grid, w_star_grid = _load_center_wstar(cpath)
+            delta_final = _train_band_delta(
+                df_train, filt_params,
+                p_grid, w_star_grid,
+                dt=dt, T_years=float(episode_T_years),
+                z_target=float(cfg.z),
+                iters=int(band_train_iters),
+                tcost=float(band_tcost),
+                delta_init=float(band_delta_init),
+                lr=float(band_train_lr),
+                gross_lev_max=band_gross_lev_max,
+                seed=int(seed),
+                outdir=outdir
+            )
+            # re-run overlay with learned delta
+            _, X_band2, gross_band2 = _backtest_band_on_logret(eval_df, filt_params, p_grid, w_star_grid, delta_final, dt=dt, x0=cfg.x0,
+                                                 tcost=float(band_tcost), gross_lev_max=band_gross_lev_max)
+            bench_df["X_BAND"] = X_band2
+            bench_df["gross_BAND"] = gross_band2
+            bench_df.to_csv(outdir/"test_backtest_compare.csv", index=False)
+
+            fig = plt.figure()
+            plt.plot(t_years, X_rl_daily, label="RL(daily)")
+            plt.plot(t_years, X_rl_month, label="RL(monthly)")
+            plt.plot(t_years, X_band2, label="BAND(width-only, learned)")
+            plt.plot(t_years, X_mv_minvar, label="MV(minvar, monthly)")
+            #plt.plot(t_years, X_mv_tan, label="MV(tangency, monthly)")
+            plt.plot(t_years, X_mv_tgt, label="MV(target, monthly)")
+            plt.plot(t_years, X_ew, label="EW(monthly)")
+            plt.xlabel("time (years)")
+            plt.ylabel("wealth X (test)")
+            plt.legend()
+            fig.tight_layout()
+            fig.savefig(outdir/"test_backtest_compare.png", dpi=200)
+            plt.close(fig)
     
     df = pd.DataFrame(rows)
     df.to_csv(outdir/"metrics.csv", index=False)
@@ -644,8 +955,22 @@ def main():
     ap.add_argument("--sim_test_seed", type=int, default=None, help="Seed for simulated TEST tape (if no test_data_pkl)")
     ap.add_argument("--mv_target_mu", type=float, default=None,
                     help="Target per-step mean log-return for MV(target). Default aligns with RL z: log(z/x0)/n_steps")
+    ap.add_argument("--rl_gross_lev_max", type=float, default=None,
+                    help="Gross leverage cap for RL backtests: sum_i |w_i| <= cap at trade times.")
     ap.add_argument("--tcost", type=float, default=0.0,
                     help="Proportional transaction cost kappa charged on rebalance: kappa * sum |Δu| (dollar turnover). Example: 0.0005 (5bps)")
+    # center export / band
+    ap.add_argument("--export_center", action="store_true", help="Export center w*(p) to npz after training")
+    ap.add_argument("--center_bins", type=int, default=99, help="Number of p-grid points for center export")
+    ap.add_argument("--center_path", type=str, default=None, help="Path to center_wstar.npz (default: outdir/center_wstar.npz)")
+    ap.add_argument("--band_overlay", action="store_true", help="Overlay Band(width-only projection) on test plot")
+    ap.add_argument("--band_delta", type=float, default=0.05, help="Initial/fixed band half-width (per asset). Used if no learned delta exists.")
+    ap.add_argument("--band_tcost", type=float, default=0.0, help="Transaction cost kappa for band backtest/train: kappa * sum|Δu|")
+    ap.add_argument("--band_gross_lev_max", type=float, default=None, help="Gross leverage cap for band projected weights (sum|w| <= cap)")
+    ap.add_argument("--band_train", action="store_true", help="Train band width delta on TRAIN tape under transaction costs")
+    ap.add_argument("--band_train_iters", type=int, default=300, help="Band training iterations (episodes)")
+    ap.add_argument("--band_train_lr", type=float, default=3e-3, help="Band delta learning rate")
+    ap.add_argument("--band_delta_init", type=float, default=0.05, help="Band delta init for training (softplus parameter init)")
 
     args = ap.parse_args()
     cols = None if args.cols is None else [c.strip() for c in args.cols.split(",") if c.strip()]
@@ -662,7 +987,20 @@ def main():
               sim_test_seed=args.sim_test_seed,
               z_target=args.z,
               mv_target_mu=args.mv_target_mu,
-              tcost=args.tcost)
+              rl_gross_lev_max=args.rl_gross_lev_max,
+              tcost=args.tcost,
+              export_center=args.export_center,
+              center_bins=args.center_bins,
+              center_path=args.center_path,
+              band_overlay=args.band_overlay,
+              band_delta=args.band_delta,
+              band_tcost=args.band_tcost,
+              band_gross_lev_max=args.band_gross_lev_max,
+              band_train=args.band_train,
+              band_train_iters=args.band_train_iters,
+              band_train_lr=args.band_train_lr,
+              band_delta_init=args.band_delta_init,
+              )
 
 if __name__ == "__main__":
     main()

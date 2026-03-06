@@ -66,6 +66,20 @@ class POEMVAgent:
         a = (cfg.a_max * np.tanh(u_raw)).astype(float)
         return a, u_raw, None
 
+    def mean_action(self, t: float, x: float, p: float) -> np.ndarray:
+        """Deterministic center action (no sampling): a_max * tanh(mean)."""
+        cfg = self.cfg
+        t_t = torch.tensor([t], dtype=cfg.dtype, device=cfg.device)
+        x_t = torch.tensor([x], dtype=cfg.dtype, device=cfg.device)
+        p_t = torch.tensor([p], dtype=cfg.dtype, device=cfg.device)
+        with torch.no_grad():
+            f = self.vf.f(t_t, p_t)
+            dlnf = self.vf.dlnf_dp(t_t, p_t)
+            mean, _std = self.pi.dist_params(x_t, self.omega, p_t, dlnf, f, cfg.Lambda, cfg.sigma)
+            u_raw = mean.detach().cpu().numpy().reshape(-1,)
+        a = (cfg.a_max * np.tanh(u_raw)).astype(float)
+        return a
+
     def update_from_episode(self, traj):
         cfg = self.cfg
         t = torch.tensor(traj["t"], dtype=cfg.dtype, device=cfg.device)   # (n+1,)
