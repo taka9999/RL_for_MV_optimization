@@ -15,6 +15,35 @@ from .heuristic import HeuristicThresholds, label_bull_bear_from_drawdowns, esti
 from .agent import POEMVAgent, TrainConfig
 from .utils import set_seed, safe_clip_p
 
+def _save_agent(agent: POEMVAgent, path: Path):
+    """
+    Save enough to reproduce evaluation EXACTLY later (policy/value/omega + cfg).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "cfg": agent.cfg.__dict__.copy(),
+        "pi": agent.pi.state_dict(),
+        "vf": agent.vf.state_dict(),
+        "omega": float(agent.omega.detach().cpu()),
+    }
+    torch.save(payload, path)
+ 
+def _load_agent(path: Path, overrides: dict | None = None) -> POEMVAgent:
+    """
+    Load agent saved by _save_agent. Optionally override cfg fields to match current CLI (dt/T/a_max/z).
+    """
+    payload = torch.load(path, map_location="cpu")
+    cfg_dict = dict(payload.get("cfg", {}))
+    if overrides:
+        for k, v in overrides.items():
+            if v is not None:
+                cfg_dict[k] = v
+    cfg = TrainConfig(**cfg_dict)
+    agent = POEMVAgent(cfg)
+    agent.pi.load_state_dict(payload["pi"], strict=True)
+    agent.vf.load_state_dict(payload["vf"], strict=True)
+    agent.omega = torch.tensor(float(payload.get("omega", 0.0)), dtype=cfg.dtype, device=cfg.device)
+    return agent
 def _parse_z_list(s: str) -> list[float]:
     # examples: "1.05,1.10,1.20" or "1.05:1.55:0.05"
     s = s.strip()
@@ -520,6 +549,7 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
           mv_target_mu: float | None = None,
           rl_gross_lev_max: float | None = None,
           tcost: float = 0.0,
+          train_gross_lev_max: float | None = None,
           export_center: bool = False,
           center_bins: int = 99,
           center_path: str | None = None,
@@ -531,7 +561,8 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
           band_train_iters: int = 300,
           band_train_lr: float = 3e-3,
           band_delta_init: float = 0.05,
-          
+          save_agent: str | None = None,
+          load_agent: str | None = None,
           ):
     set_seed(seed)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -564,7 +595,16 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
                         Lambda=Lambda, alpha_theta=alpha_theta, alpha_phi=alpha_phi, alpha_w=alpha_w,
                         omega_update_every=omega_update_every, a_max=a_max,
                         )
-    agent = POEMVAgent(cfg)
+    # If load_agent is specified, we skip the RL training loop and only run eval/band.
+    if load_agent is not None:
+        agent = _load_agent(Path(load_agent), overrides={
+            "T_years": float(episode_T_years),
+            "dt": float(dt),
+            "a_max": float(a_max),
+            "z": float(z_target),
+        })
+    else:
+        agent = POEMVAgent(cfg)
 
     # ----- historical data setup -----
     df_train = None
@@ -585,132 +625,138 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
     last_mean_xT_window = float("nan")
     last_gap = float("nan")
     last_domega = 0.0
+    if load_agent is None:
+        for m in range(1, iters+1):
+            # One episode:
+            # - simulation: RSGBMEnv as before
+            # - historical: sample a random window from train log-returns
+            if not use_hist_train:
+                env = RSGBMEnv(true_params, EpisodeConfig(
+                    T_years=episode_T_years, dt=dt, x0=cfg.x0, s0=cfg.s0, p0=cfg.p0,
+                    a_max=a_max,
+                    omega=float(agent.omega.detach().cpu()), seed=seed + m
+                ))
+                obs = env.reset()
+                n = env.n_steps
+                # infer asset dimension from the agent action (more reliable than obs["S"])
+                u_tmp, u_raw_tmp, _ = agent.act(0.0, cfg.x0, cfg.p0)
+                d = int(np.asarray(u_tmp).size)            
+            else:
+                # sample start so that we can take n steps (n = episode length)
+                n = int(round(episode_T_years / dt))
+                if logret_train.shape[0] <= n + 1:
+                    raise ValueError("train period too short for the requested episode length")
+                start = np.random.default_rng(seed + m).integers(0, logret_train.shape[0] - n)
+                env = HistoricalLogReturnEnv(logret_train[start:start+n], dt=dt, x0=cfg.x0, seed=seed+m)
+                obs = env.reset(0)
+                d = env.d
 
-    for m in range(1, iters+1):
-        # One episode:
-        # - simulation: RSGBMEnv as before
-        # - historical: sample a random window from train log-returns
-        if not use_hist_train:
-            env = RSGBMEnv(true_params, EpisodeConfig(
-                T_years=episode_T_years, dt=dt, x0=cfg.x0, s0=cfg.s0, p0=cfg.p0,
-                a_max=a_max,
-                omega=float(agent.omega.detach().cpu()), seed=seed + m
+            #n = env.n_steps
+            t_arr = np.empty(n+1); x_arr = np.empty(n+1); p_arr = np.empty(n+1)
+            #logp_arr = np.empty(n); ent_arr = np.empty(n)
+            #u_arr = np.empty((n, getattr(env, "d", 1))) if use_historical else np.empty(n)
+            # always store vector actions/logits (d assets)
+            u_arr = np.empty((n, d), dtype=float)
+
+            p = cfg.p0
+            t_arr[0]=0.0; x_arr[0]=cfg.x0; p_arr[0]=p
+            S_prev = obs["S"]
+            #u_raw_arr = np.empty((n,2))
+            #u_raw_arr = np.empty((n, getattr(env, "d", 1))) if use_historical else np.empty(n)
+            u_raw_arr = np.empty((n, d), dtype=float)
+
+            for k in range(n):
+                u, u_raw, _ = agent.act(t_arr[k], x_arr[k], p)
+                #u_raw_arr[k] = np.asarray(u_raw, float)
+                #u_arr[k] = np.asarray(u, float)
+                #if use_historical:
+                #    u_raw_arr[k] = np.asarray(u_raw, float)
+                #    u_arr[k] = np.asarray(u, float)
+                #else:
+                #    u_raw_arr[k] = float(u_raw)
+                #    u_arr[k] = float(u)
+                u_raw_arr[k] = np.asarray(u_raw, float).reshape(d,)
+                #u_arr[k]     = np.asarray(u, float).reshape(d,)
+                #obs, _, done = env.step(u)
+                u_vec = np.asarray(u, float).reshape(d,)
+
+                # --- TRAIN: enforce gross leverage cap every step ---
+                # w = u / X  (dollar positions / wealth)
+                if (train_gross_lev_max is not None) and (train_gross_lev_max > 0):
+                    denom = float(x_arr[k]) if abs(float(x_arr[k])) > 1e-12 else 1e-12
+                    lev = float(np.sum(np.abs(u_vec / denom)))
+                    if lev > float(train_gross_lev_max):
+                        u_vec = u_vec * (float(train_gross_lev_max) / lev)
+
+                u_arr[k] = u_vec
+                obs, _, done = env.step(u_vec)
+                S_now = obs["S"]
+                log_return = np.log(np.asarray(S_now, float) / np.asarray(S_prev, float))  # (d,)
+                p, _ = wonham_filter_q_update(p, log_return, dt, filt_params)
+                p = safe_clip_p(p)
+
+                t_arr[k+1] = obs["t"]
+                x_arr[k+1] = obs["X"]
+                p_arr[k+1] = p
+                #logp_arr[k] = float(logprob.detach().cpu())
+                #ent_arr[k] = float(entropy.detach().cpu())
+                S_prev = S_now
+                if done:
+                    break
+
+            steps_done = k + 1
+            t_arr = t_arr[:steps_done+1]
+            x_arr = x_arr[:steps_done+1]
+            p_arr = p_arr[:steps_done+1]
+            u_raw_arr = u_raw_arr[:steps_done]
+            u_arr = u_arr[:steps_done]
+
+            traj = dict(t=t_arr, x=x_arr, p=p_arr, u=u_arr, u_raw=u_raw_arr, a_max=a_max)
+            loss_c, loss_a = agent.update_from_episode(traj)
+
+            xT = float(x_arr[-1])
+            last_terminals.append(xT)
+            #if len(last_terminals) > omega_update_every:
+            #    last_terminals = last_terminals[-omega_update_every:]
+
+            #if (m % omega_update_every) == 0:
+            #    agent.update_omega(float(np.mean(last_terminals)))
+            # keep a rolling window used for omega update
+            if len(last_terminals) > omega_update_every:
+                last_terminals = last_terminals[-omega_update_every:]
+
+            last_domega = 0.0
+            if (m % omega_update_every) == 0:
+                mean_xT = float(np.mean(last_terminals))
+                last_mean_xT_window = mean_xT
+                last_gap = mean_xT - cfg.z
+                omega_before = float(agent.omega.detach().cpu())
+                agent.update_omega(mean_xT)
+                omega_after = float(agent.omega.detach().cpu())
+                last_domega = omega_after - omega_before
+
+            phi = agent.phi_values()
+            rows.append(dict(
+                iter=m,
+                omega=float(agent.omega.detach().cpu()),
+                mean_terminal=float(np.mean(last_terminals)),
+                xT=xT,
+                mean_xT_window=last_mean_xT_window,
+                mean_xT_minus_z=last_gap,
+                domega=last_domega,
+                loss_critic=loss_c,
+                loss_actor=loss_a,
+                **phi
             ))
-            obs = env.reset()
-            n = env.n_steps
-            # infer asset dimension from the agent action (more reliable than obs["S"])
-            u_tmp, u_raw_tmp, _ = agent.act(0.0, cfg.x0, cfg.p0)
-            d = int(np.asarray(u_tmp).size)            
-        else:
-            # sample start so that we can take n steps (n = episode length)
-            n = int(round(episode_T_years / dt))
-            if logret_train.shape[0] <= n + 1:
-                raise ValueError("train period too short for the requested episode length")
-            start = np.random.default_rng(seed + m).integers(0, logret_train.shape[0] - n)
-            env = HistoricalLogReturnEnv(logret_train[start:start+n], dt=dt, x0=cfg.x0, seed=seed+m)
-            obs = env.reset(0)
-            d = env.d
 
-        #n = env.n_steps
-        t_arr = np.empty(n+1); x_arr = np.empty(n+1); p_arr = np.empty(n+1)
-        #logp_arr = np.empty(n); ent_arr = np.empty(n)
-        #u_arr = np.empty((n, getattr(env, "d", 1))) if use_historical else np.empty(n)
-        # always store vector actions/logits (d assets)
-        u_arr = np.empty((n, d), dtype=float)
-
-        p = cfg.p0
-        t_arr[0]=0.0; x_arr[0]=cfg.x0; p_arr[0]=p
-        S_prev = obs["S"]
-        #u_raw_arr = np.empty((n,2))
-        #u_raw_arr = np.empty((n, getattr(env, "d", 1))) if use_historical else np.empty(n)
-        u_raw_arr = np.empty((n, d), dtype=float)
-
-        for k in range(n):
-            u, u_raw, _ = agent.act(t_arr[k], x_arr[k], p)
-            #u_raw_arr[k] = np.asarray(u_raw, float)
-            #u_arr[k] = np.asarray(u, float)
-            #if use_historical:
-            #    u_raw_arr[k] = np.asarray(u_raw, float)
-            #    u_arr[k] = np.asarray(u, float)
-            #else:
-            #    u_raw_arr[k] = float(u_raw)
-            #    u_arr[k] = float(u)
-            u_raw_arr[k] = np.asarray(u_raw, float).reshape(d,)
-            u_arr[k]     = np.asarray(u, float).reshape(d,)
-            obs, _, done = env.step(u)
-            #S_now = obs["S"]
-            #log_return = np.log(S_now / S_prev)  # (2,)
-            # observed log-return for filtering
-            #if use_historical:
-            #    # in Historical env, S is updated using the log-return already;
-            #    # recover it from prices (stable enough) OR store it in env if you prefer
-            #    S_now = obs["S"]
-            #    log_return = np.log(S_now / S_prev)        # (d,)
-            #else:
-            #    S_now = obs["S"]
-            #    log_return = float(np.log(S_now / S_prev)) # scalar
-            # observed log-return for filtering (always vector now)
-            S_now = obs["S"]
-            log_return = np.log(np.asarray(S_now, float) / np.asarray(S_prev, float))  # (d,)
-            p, _ = wonham_filter_q_update(p, log_return, dt, filt_params)
-            p = safe_clip_p(p)
-
-            t_arr[k+1] = obs["t"]
-            x_arr[k+1] = obs["X"]
-            p_arr[k+1] = p
-            #logp_arr[k] = float(logprob.detach().cpu())
-            #ent_arr[k] = float(entropy.detach().cpu())
-            S_prev = S_now
-            if done:
-                break
-
-        steps_done = k + 1
-        t_arr = t_arr[:steps_done+1]
-        x_arr = x_arr[:steps_done+1]
-        p_arr = p_arr[:steps_done+1]
-        u_raw_arr = u_raw_arr[:steps_done]
-        u_arr = u_arr[:steps_done]
-
-        traj = dict(t=t_arr, x=x_arr, p=p_arr, u=u_arr, u_raw=u_raw_arr, a_max=a_max)
-        loss_c, loss_a = agent.update_from_episode(traj)
-
-        xT = float(x_arr[-1])
-        last_terminals.append(xT)
-        #if len(last_terminals) > omega_update_every:
-        #    last_terminals = last_terminals[-omega_update_every:]
-
-        #if (m % omega_update_every) == 0:
-        #    agent.update_omega(float(np.mean(last_terminals)))
-        # keep a rolling window used for omega update
-        if len(last_terminals) > omega_update_every:
-            last_terminals = last_terminals[-omega_update_every:]
-
-        last_domega = 0.0
-        if (m % omega_update_every) == 0:
-            mean_xT = float(np.mean(last_terminals))
-            last_mean_xT_window = mean_xT
-            last_gap = mean_xT - cfg.z
-            omega_before = float(agent.omega.detach().cpu())
-            agent.update_omega(mean_xT)
-            omega_after = float(agent.omega.detach().cpu())
-            last_domega = omega_after - omega_before
-
-        phi = agent.phi_values()
-        rows.append(dict(
-            iter=m,
-            omega=float(agent.omega.detach().cpu()),
-            mean_terminal=float(np.mean(last_terminals)),
-            xT=xT,
-            mean_xT_window=last_mean_xT_window,
-            mean_xT_minus_z=last_gap,
-            domega=last_domega,
-            loss_critic=loss_c,
-            loss_actor=loss_a,
-            **phi
-        ))
-
-        if m % max(100, omega_update_every) == 0:
-            pd.DataFrame(rows).to_csv(outdir/"metrics.csv", index=False)
+            if m % max(100, omega_update_every) == 0:
+                pd.DataFrame(rows).to_csv(outdir/"metrics.csv", index=False)
+        # save checkpoint at end of training (optional)
+        if save_agent is not None:
+            _save_agent(agent, Path(save_agent))
+    else:
+        # no training -> keep files consistent
+        pd.DataFrame([]).to_csv(outdir/"metrics.csv", index=False)
     # ----- historical TEST backtest (deterministic mean action is recommended) -----
     if use_hist_test:
         eval_logret = logret_test
@@ -745,11 +791,11 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
 
         target_mu_step = float(mv_target_mu) if mv_target_mu is not None else float(np.log(cfg.z / cfg.x0) / max(n_steps, 1))
         dates_path, X_mv_minvar, X_ew, gross_mv_minvar, gross_ew = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="minvar",
-                                                                x0=cfg.x0, tcost=tcost)
+                                                                x0=cfg.x0, gross_lev_max=train_gross_lev_max,tcost=tcost)
         _, X_mv_tan, _Xew2, gross_mv_tan, _gross_ew2     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="tangency",
-                                                                x0=cfg.x0, tcost=tcost)
+                                                                x0=cfg.x0, gross_lev_max=train_gross_lev_max,tcost=tcost)
         _, X_mv_tgt, _Xew3, gross_mv_tgt, _gross_ew3     = _backtest_monthly_MV_EW(eval_df, lookback_days=lookback_days, mv_kind="target",
-                                                                x0=cfg.x0, target_mu=target_mu_step, gross_lev_max=1.5, tcost=tcost)
+                                                                x0=cfg.x0, target_mu=target_mu_step, gross_lev_max=train_gross_lev_max, tcost=tcost)
 
 
         # Save benchmark paths
@@ -769,30 +815,56 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             "gross_MV_target": gross_mv_tgt,
             "gross_EW": gross_ew,
         })
-        # (2) band overlay (width-only projection) on the same test tape
+        # (2) band overlay: compute BOTH fixed and learned (if available) on the SAME eval_df
         if band_overlay:
             cpath = Path(center_path) if center_path is not None else (outdir/"center_wstar.npz")
             if not cpath.exists():
                 # if center wasn't exported yet, export now
                 _export_center_wstar_p(agent, cpath, p_bins=int(center_bins), t0=0.0, x0=1.0)
             p_grid, w_star_grid = _load_center_wstar(cpath)
-            # delta can be learned delta file
-            delta_vec = np.full((eval_df.shape[1],), float(band_delta), dtype=float)
-            # if band training produced band_delta.npz, prefer it
-            learned = outdir/"band_delta.npz"
-            if learned.exists():
-                try:
-                    delta_vec = np.load(learned)["delta"].astype(float).reshape(-1,)
-                except Exception:
-                    pass
-            _, X_band, gross_band = _backtest_band_on_logret(
+        #    # delta can be learned delta file
+        #    delta_vec = np.full((eval_df.shape[1],), float(band_delta), dtype=float)
+        #    # if band training produced band_delta.npz, prefer it
+        #    learned = outdir/"band_delta.npz"
+        #    if learned.exists():
+        #        try:
+        #            delta_vec = np.load(learned)["delta"].astype(float).reshape(-1,)
+        #        except Exception:
+        #            pass
+        #    _, X_band, gross_band = _backtest_band_on_logret(
+        #        eval_df, filt_params, p_grid, w_star_grid,
+        #        delta=delta_vec, dt=dt, x0=cfg.x0,
+        #        tcost=float(band_tcost),
+        #        gross_lev_max=band_gross_lev_max
+        #    )
+        #    bench_df["X_BAND"] = X_band
+        #    bench_df["gross_BAND"] = gross_band
+            # ---- fixed delta (CLI) ----
+            delta_fixed = np.full((eval_df.shape[1],), float(band_delta), dtype=float)
+            _, X_band_fixed, gross_band_fixed = _backtest_band_on_logret(
                 eval_df, filt_params, p_grid, w_star_grid,
-                delta=delta_vec, dt=dt, x0=cfg.x0,
+                delta=delta_fixed, dt=dt, x0=cfg.x0,
                 tcost=float(band_tcost),
                 gross_lev_max=band_gross_lev_max
             )
-            bench_df["X_BAND"] = X_band
-            bench_df["gross_BAND"] = gross_band
+            bench_df["X_BAND_fixed"] = X_band_fixed
+            bench_df["gross_BAND_fixed"] = gross_band_fixed
+
+            # ---- learned delta (if exists) ----
+            learned = outdir/"band_delta.npz"
+            if learned.exists():
+                try:
+                    delta_learn = np.load(learned)["delta"].astype(float).reshape(-1,)
+                    _, X_band_learned, gross_band_learned = _backtest_band_on_logret(
+                        eval_df, filt_params, p_grid, w_star_grid,
+                        delta=delta_learn, dt=dt, x0=cfg.x0,
+                        tcost=float(band_tcost),
+                        gross_lev_max=band_gross_lev_max
+                    )
+                    bench_df["X_BAND_learned"] = X_band_learned
+                    bench_df["gross_BAND_learned"] = gross_band_learned
+                except Exception:
+                    pass
         bench_df.to_csv(outdir/"test_backtest_compare.csv", index=False)
         # --- gross leverage time-series plot (separate png, no subplots) ---
         fig = plt.figure()
@@ -810,7 +882,9 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         #_plot_if("gross_MV_tangency","MV(tangency, monthly)")
         _plot_if("gross_MV_target",  "MV(target, monthly)")
         _plot_if("gross_EW",         "EW(monthly)")
-        _plot_if("gross_BAND",       "BAND(width-only)")
+        #_plot_if("gross_BAND",       "BAND(width-only)")
+        _plot_if("gross_BAND_fixed",   "BAND(fixed)")
+        _plot_if("gross_BAND_learned", "BAND(learned)")
 
         plt.xlabel("time (years)")
         plt.ylabel("gross leverage (sum |w|)")
@@ -830,8 +904,12 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         #plt.plot(t_years, X_mv_tan, label="MV(tangency, monthly)")
         plt.plot(t_years, X_mv_tgt, label="MV(target, monthly)")
         plt.plot(t_years, X_ew, label="EW(monthly)")
-        if "X_BAND" in bench_df.columns:
-            plt.plot(t_years, bench_df["X_BAND"].values, label="BAND(width-only)")
+        #if "X_BAND" in bench_df.columns:
+        #    plt.plot(t_years, bench_df["X_BAND"].values, label="BAND(width-only)")
+        if "X_BAND_fixed" in bench_df.columns:
+            plt.plot(t_years, bench_df["X_BAND_fixed"].values, label="BAND(fixed)")
+        if "X_BAND_learned" in bench_df.columns:
+            plt.plot(t_years, bench_df["X_BAND_learned"].values, label="BAND(learned)")
         plt.xlabel("time (years)")
         plt.ylabel("wealth X (test)")
         plt.legend()
@@ -863,14 +941,19 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             # re-run overlay with learned delta
             _, X_band2, gross_band2 = _backtest_band_on_logret(eval_df, filt_params, p_grid, w_star_grid, delta_final, dt=dt, x0=cfg.x0,
                                                  tcost=float(band_tcost), gross_lev_max=band_gross_lev_max)
-            bench_df["X_BAND"] = X_band2
-            bench_df["gross_BAND"] = gross_band2
+            #bench_df["X_BAND"] = X_band2
+            #bench_df["gross_BAND"] = gross_band2
+            bench_df["X_BAND_learned"] = X_band2
+            bench_df["gross_BAND_learned"] = gross_band2
             bench_df.to_csv(outdir/"test_backtest_compare.csv", index=False)
 
             fig = plt.figure()
             plt.plot(t_years, X_rl_daily, label="RL(daily)")
             plt.plot(t_years, X_rl_month, label="RL(monthly)")
-            plt.plot(t_years, X_band2, label="BAND(width-only, learned)")
+            #plt.plot(t_years, X_band2, label="BAND(width-only, learned)")
+            if "X_BAND_fixed" in bench_df.columns:
+                plt.plot(t_years, bench_df["X_BAND_fixed"].values, label="BAND(fixed)")
+            plt.plot(t_years, X_band2, label="BAND(learned)")
             plt.plot(t_years, X_mv_minvar, label="MV(minvar, monthly)")
             #plt.plot(t_years, X_mv_tan, label="MV(tangency, monthly)")
             plt.plot(t_years, X_mv_tgt, label="MV(target, monthly)")
@@ -882,18 +965,22 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             fig.savefig(outdir/"test_backtest_compare.png", dpi=200)
             plt.close(fig)
     
-    df = pd.DataFrame(rows)
-    df.to_csv(outdir/"metrics.csv", index=False)
+    # Save/plot learning curves only if we actually trained (rows non-empty).
+    if len(rows) > 0:
+        df = pd.DataFrame(rows)
+        df.to_csv(outdir/"metrics.csv", index=False)
 
-    # plots
-    fig = plt.figure()
-    plt.plot(df["iter"], df["mean_terminal"])
-    plt.axhline(cfg.z, linestyle="--")
-    plt.xlabel("iteration")
-    plt.ylabel("mean terminal wealth (recent window)")
-    fig.tight_layout()
-    fig.savefig(outdir/"learning_curves.png", dpi=200)
-    plt.close(fig)
+        fig = plt.figure()
+        plt.plot(df["iter"], df["mean_terminal"])
+        plt.axhline(cfg.z, linestyle="--")
+        plt.xlabel("iteration")
+        plt.ylabel("mean terminal wealth (recent window)")
+        fig.tight_layout()
+        fig.savefig(outdir/"learning_curves.png", dpi=200)
+        plt.close(fig)
+    else:
+        # still write an empty metrics.csv for reproducibility when --load_agent is used
+        pd.DataFrame().to_csv(outdir/"metrics.csv", index=False)
 
     with open(outdir/"run_config.json","w",encoding="utf-8") as f:
         import json
@@ -959,18 +1046,26 @@ def main():
                     help="Gross leverage cap for RL backtests: sum_i |w_i| <= cap at trade times.")
     ap.add_argument("--tcost", type=float, default=0.0,
                     help="Proportional transaction cost kappa charged on rebalance: kappa * sum |Δu| (dollar turnover). Example: 0.0005 (5bps)")
+    ap.add_argument("--train_gross_lev_max", type=float, default=None,
+                    help="(TRAIN) Gross leverage cap enforced every step during training: sum_i |u_i/X| <= cap. "
+                         "Note: this projects executed action before env.step().")
     # center export / band
     ap.add_argument("--export_center", action="store_true", help="Export center w*(p) to npz after training")
     ap.add_argument("--center_bins", type=int, default=99, help="Number of p-grid points for center export")
     ap.add_argument("--center_path", type=str, default=None, help="Path to center_wstar.npz (default: outdir/center_wstar.npz)")
     ap.add_argument("--band_overlay", action="store_true", help="Overlay Band(width-only projection) on test plot")
-    ap.add_argument("--band_delta", type=float, default=0.05, help="Initial/fixed band half-width (per asset). Used if no learned delta exists.")
+    ap.add_argument("--band_delta", type=float, default=0.01, help="Initial/fixed band half-width (per asset). Used if no learned delta exists.")
     ap.add_argument("--band_tcost", type=float, default=0.0, help="Transaction cost kappa for band backtest/train: kappa * sum|Δu|")
     ap.add_argument("--band_gross_lev_max", type=float, default=None, help="Gross leverage cap for band projected weights (sum|w| <= cap)")
     ap.add_argument("--band_train", action="store_true", help="Train band width delta on TRAIN tape under transaction costs")
     ap.add_argument("--band_train_iters", type=int, default=300, help="Band training iterations (episodes)")
     ap.add_argument("--band_train_lr", type=float, default=3e-3, help="Band delta learning rate")
     ap.add_argument("--band_delta_init", type=float, default=0.05, help="Band delta init for training (softplus parameter init)")
+    ap.add_argument("--save_agent", type=str, default=None,
+                    help="Save trained agent checkpoint (.pt). Saved at end of RL training.")
+    ap.add_argument("--load_agent", type=str, default=None,
+                    help="Load agent checkpoint (.pt) and SKIP RL training loop (eval/band only).")
+
 
     args = ap.parse_args()
     cols = None if args.cols is None else [c.strip() for c in args.cols.split(",") if c.strip()]
@@ -989,6 +1084,7 @@ def main():
               mv_target_mu=args.mv_target_mu,
               rl_gross_lev_max=args.rl_gross_lev_max,
               tcost=args.tcost,
+              train_gross_lev_max=args.train_gross_lev_max,
               export_center=args.export_center,
               center_bins=args.center_bins,
               center_path=args.center_path,
@@ -1000,6 +1096,8 @@ def main():
               band_train_iters=args.band_train_iters,
               band_train_lr=args.band_train_lr,
               band_delta_init=args.band_delta_init,
+              save_agent=args.save_agent,
+              load_agent=args.load_agent,
               )
 
 if __name__ == "__main__":
