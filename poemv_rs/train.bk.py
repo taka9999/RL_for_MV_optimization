@@ -7,7 +7,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 import torch.optim as optim
-import torch.nn as nn
 
 from .env import RSGBMParams,EpisodeConfig, RSGBMEnv,simulate_price_only,HistoricalLogReturnEnv
 from .filtering import FilterParams, wonham_filter_q_update
@@ -412,119 +411,6 @@ def _backtest_band_on_logret(logret_df: pd.DataFrame,
     dates_path = pd.Index(dates).insert(0, dates[0] - pd.Timedelta(days=1))
     return dates_path, X, gross
 
-def _backtest_band_gate_on_logret(logret_df: pd.DataFrame,
-                                  filt_params: FilterParams,
-                                  p_grid: np.ndarray, w_star_grid: np.ndarray,
-                                  gate_model: nn.Module,
-                                  dt: float,
-                                  x0: float = 1.0,
-                                  tcost: float = 0.0,
-                                  gross_lev_max: float | None = None,
-                                  p0: float = 0.5,
-                                  delta_init: float = 0.05,
-                                  cubic_root: bool = True,
-                                  gamma_mv: float = 1.0,
-                                  alpha_floor: float = 0.05,
-                                  delta_floor: float = 0.05
-                                  ):
-    """
-    2a backtest:
-      - gate decides trade / no-trade
-      - if trade, move to fixed projection target
-    """
-    df = logret_df.copy().dropna(how="any")
-    dates = pd.to_datetime(df.index)
-    logret = df.values.astype(float)
-    ret = np.exp(logret) - 1.0
-    T, d = logret.shape
-
-    device = torch.device("cpu")
-    gate_model.eval()
-    c0 = np.full((d,), float(delta_init), dtype=float)
-    kappa13 = float((max(float(tcost), 1e-12)) ** (1.0 / 3.0))
-
-    X = np.empty(T + 1, dtype=float)
-    X[0] = float(x0)
-    gross = np.empty(T + 1, dtype=float)
-    gross[0] = 0.0
-    trade_prob_path = np.empty(T, dtype=float)
-
-    u = np.zeros(d, dtype=float)
-    S = np.ones(d, dtype=float)
-    p = float(p0)
-
-    for t in range(T):
-        w = (u / X[t]) if abs(X[t]) > 1e-12 else np.zeros(d)
-        w_star = _interp_wstar(p, p_grid, w_star_grid)
-
-        if cubic_root:
-            Sigma_p = _sigma_from_belief(p, filt_params)
-            a2_scale = _a2_scale_from_wstar_sigma(w_star, Sigma_p, gamma_mv=gamma_mv)
-            delta_t = c0 * kappa13 * a2_scale
-        else:
-            delta_t = c0
-        delta_t = np.maximum(delta_t, float(delta_floor))
-        dev = w - w_star
-        proj = w_star + np.clip(dev, -delta_t, +delta_t)
-
-        if (gross_lev_max is not None) and (gross_lev_max > 0):
-            lev = float(np.sum(np.abs(proj)))
-            if lev > gross_lev_max:
-                proj = proj * (gross_lev_max / (lev + 1e-12))
-
-        turn_to_proj = float(np.sum(np.abs((proj - w) * X[t])))
-        turn_ratio = turn_to_proj / (float(X[t]) + 1e-12)
-
-        with torch.no_grad():
-            logit = gate_model(
-                torch.tensor(w, dtype=torch.float64),
-                torch.tensor(dev, dtype=torch.float64),
-                p,
-                torch.tensor(delta_t, dtype=torch.float64),
-                torch.tensor(turn_ratio, dtype=torch.float64),
-            )
-            prob_raw = float(torch.sigmoid(logit).cpu())
-            prob = float(alpha_floor) + (1.0 - float(alpha_floor)) * prob_raw
-
-        trade_prob_path[t] = prob
-        # A: evaluation uses soft execution, not hard threshold
-        # B: force first intervention to avoid cash-absorption
-        alpha = 1.0 if t == 0 else prob
-        w_new = (1.0 - alpha) * w + alpha * proj
-        turn = float(np.sum(np.abs((w_new - w) * X[t])))
-        cost = float(tcost) * turn if tcost > 0 else 0.0
-        X_after = X[t] - cost
-        if X_after <= 1e-12:
-            X[t] = 1e-12
-            u = np.zeros_like(u)
-        else:
-            X[t] = X_after
-            u = w_new * X[t]
-        
-        #do_trade = (prob >= 0.5)
-        #if do_trade:
-        #    cost = float(tcost) * turn_to_proj if tcost > 0 else 0.0
-        #    X_after = X[t] - cost
-        #    if X_after <= 1e-12:
-        #        X[t] = 1e-12
-        #        u = np.zeros_like(u)
-        #    else:
-        #        X[t] = X_after
-        #        u = proj * X[t]
-
-        X[t+1] = X[t] + float(u @ ret[t])
-        denom = X[t+1] if abs(X[t+1]) > 1e-12 else 1e-12
-        gross[t+1] = float(np.sum(np.abs(u / denom)))
-
-        S_next = S * np.exp(logret[t])
-        lr = np.log(S_next / S)
-        p, _ = wonham_filter_q_update(p, lr, dt, filt_params)
-        p = safe_clip_p(p)
-        S = S_next
-
-    dates_path = pd.Index(dates).insert(0, dates[0] - pd.Timedelta(days=1))
-    return dates_path, X, gross, trade_prob_path
-
 def run_filter_demo(outdir: Path, true_params: RSGBMParams, est_params: RSGBMParams, T_years=10.0, dt=1/252, seed=0):
     S, I = simulate_price_only(true_params, T_years=T_years, dt=dt, s0=1.0, seed=seed)
     logret = np.log(S[1:] / S[:-1])  # (n,2)
@@ -613,104 +499,6 @@ def _a2_scale_from_wstar_sigma(w_star: np.ndarray,
     Gamma_ii = np.maximum(float(gamma_mv) * np.diag(Sigma), eps)
     scale = np.power(Dii / Gamma_ii, 1.0 / 3.0)
     return scale
-
-def _precompute_band_features_on_tape(
-    logret_df: pd.DataFrame,
-    filt_params: FilterParams,
-    p_grid: np.ndarray,
-    w_star_grid: np.ndarray,
-    dt: float,
-    p0: float = 0.5,
-    gamma_mv: float = 1.0,
-):
-    """
-    Precompute along the whole historical tape:
-      p_t          : belief before observing step t
-      w_star_t     : center weight at p_t
-      a2_scale_t   : ((Dii/Gamma_ii))^(1/3) at p_t
-      ret_t        : simple returns exp(logret)-1
-
-    Returns dict of numpy arrays:
-      logret:    (T,d)
-      ret:       (T,d)
-      p:         (T,)
-      w_star:    (T,d)
-      a2_scale:  (T,d)
-    """
-    df = logret_df.copy().dropna(how="any")
-    logret = df.values.astype(np.float64)
-    ret = np.exp(logret) - 1.0
-    T, d = logret.shape
-
-    p_path = np.empty(T, dtype=np.float64)
-    wstar_path = np.empty((T, d), dtype=np.float64)
-    a2_path = np.empty((T, d), dtype=np.float64)
-
-    p = float(p0)
-    S = np.ones(d, dtype=np.float64)
-
-    for t in range(T):
-        p_path[t] = p
-        w_star_t = _interp_wstar(p, p_grid, w_star_grid)
-        Sigma_p = _sigma_from_belief(p, filt_params)
-        a2_t = _a2_scale_from_wstar_sigma(w_star_t, Sigma_p, gamma_mv=gamma_mv)
-
-        wstar_path[t] = w_star_t
-        a2_path[t] = a2_t
-
-        S_next = S * np.exp(logret[t])
-        lr = np.log(S_next / S)
-        p, _ = wonham_filter_q_update(p, lr, dt, filt_params)
-        p = float(safe_clip_p(p))
-        S = S_next
-
-    return {
-        "logret": logret,
-        "ret": ret,
-        "p": p_path,
-        "w_star": wstar_path,
-        "a2_scale": a2_path,
-    }
-
-class BandGateNet(nn.Module):
-    """
-    Bernoulli gate for intervene / continue.
-    Input state per step:
-      [w(0:d), dev(0:d), p, delta_t(0:d), turn_to_proj]
-    Output:
-      scalar logit for trade probability
-    """
-    def __init__(self, d: int, hidden: int = 32):
-        super().__init__()
-        in_dim = 3 * d + 4
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, 1),
-        )
-
-    def forward(self, w: torch.Tensor, dev: torch.Tensor, p: float,
-                delta_t: torch.Tensor, turn_to_proj: torch.Tensor) -> torch.Tensor:
-        if not torch.is_tensor(turn_to_proj):
-            turn_to_proj = torch.tensor(float(turn_to_proj), dtype=w.dtype, device=w.device)
-        p_t = torch.tensor([float(p)], dtype=w.dtype, device=w.device)
-        dist_to_boundary = torch.max(torch.abs(dev) / (delta_t + 1e-12)).reshape(1)
-        score_raw = dist_to_boundary - 1.0
-        # clipped / squashed score for stability
-        score = torch.tanh(score_raw / 3.0).reshape(1)
-        #score = (dist_to_boundary - 1.0).reshape(1)
-        x = torch.cat([
-            w.reshape(-1),
-            dev.reshape(-1),
-            p_t,
-            delta_t.reshape(-1),
-            turn_to_proj.reshape(1),
-            dist_to_boundary,
-            score,
-        ], dim=0)
-        return self.net(x).squeeze(-1)
 
 def _train_band_delta(logret_train_df: pd.DataFrame,
                     filt_params: FilterParams,
@@ -874,362 +662,6 @@ def _train_band_delta(logret_train_df: pd.DataFrame,
     np.savez(outdir/"band_delta.npz", c=c_final)
     return c_final
 
-def _train_band_gate(logret_train_df: pd.DataFrame,
-                     filt_params: FilterParams,
-                     p_grid: np.ndarray, w_star_grid: np.ndarray,
-                     dt: float, T_years: float,
-                     z_target: float,
-                     iters: int,
-                     tcost: float,
-                     delta_init: float,
-                     lr: float,
-                     gross_lev_max: float | None,
-                     batch_size: int,
-                     omega_fixed: float | None,
-                     cubic_root: bool,
-                     seed: int,
-                     outdir: Path,
-                     p0: float = 0.5,
-                     gamma_mv: float = 1.0,
-                     gate_hidden: int = 32,
-                     ):
-    """
-    2a: Learn only the intervene/continue decision.
-    Projection target is fixed at current band boundary:
-        proj = w* + clip(w-w*, -delta_t, +delta_t)
-    Gate is Bernoulli(pi_trade(state)).
-    Uses REINFORCE with terminal utility.
-    """
-    df = logret_train_df.copy().dropna(how="any")
-    logret_all = df.values.astype(np.float64)
-    T_all, d = logret_all.shape
-    n_steps = int(round(T_years / dt))
-    if T_all <= n_steps + 5:
-        raise ValueError("train data too short for band gate training episode length")
-
-    rng = np.random.default_rng(seed)
-    device = torch.device("cpu")
-
-    # keep the same A2 width parameterization, but do NOT learn it here
-    kappa13 = float((max(float(tcost), 1e-12)) ** (1.0 / 3.0))
-    c0 = np.full((d,), float(delta_init), dtype=float)
-
-    gate = BandGateNet(d=d, hidden=int(gate_hidden)).to(device=device, dtype=torch.float64)
-    opt = optim.Adam(gate.parameters(), lr=float(lr))
-
-    omega = torch.tensor(float(0.0 if omega_fixed is None else omega_fixed),
-                         dtype=torch.float64, device=device)
-
-    batch_size = int(max(1, batch_size))
-    rows = []
-
-    for it in range(1, iters + 1):
-        xT_sum = 0.0
-        p_trade_sum = 0.0
-        n_trade_sum = 0.0
-        h_list = []
-        logprob_list = []
-
-        for b in range(batch_size):
-            start = int(rng.integers(0, T_all - n_steps))
-            logret = torch.tensor(logret_all[start:start+n_steps], dtype=torch.float64, device=device)
-            ret = torch.exp(logret) - 1.0
-
-            x = torch.tensor(1.0, dtype=torch.float64, device=device)
-            u = torch.zeros(d, dtype=torch.float64, device=device)
-            S = torch.ones(d, dtype=torch.float64, device=device)
-            p = float(p0)
-
-            logprob_sum = torch.tensor(0.0, dtype=torch.float64, device=device)
-            trade_count = 0.0
-            trade_prob_acc = 0.0
-
-            for t in range(n_steps):
-                w = u / (x + 1e-12)
-
-                w_star_np = _interp_wstar(p, p_grid, w_star_grid)
-                w_star = torch.tensor(w_star_np, dtype=torch.float64, device=device)
-
-                if cubic_root:
-                    Sigma_p = _sigma_from_belief(p, filt_params)
-                    a2_scale = _a2_scale_from_wstar_sigma(w_star_np, Sigma_p, gamma_mv=gamma_mv)
-                    delta_t = torch.tensor(c0 * kappa13 * a2_scale, dtype=torch.float64, device=device)
-                else:
-                    delta_t = torch.tensor(c0, dtype=torch.float64, device=device)
-
-                dev = w - w_star
-                proj = w_star + torch.clamp(dev, -delta_t, +delta_t)
-
-                if (gross_lev_max is not None) and (gross_lev_max > 0):
-                    lev = torch.sum(torch.abs(proj))
-                    proj = torch.where(
-                        lev > gross_lev_max,
-                        proj * (gross_lev_max / (lev + 1e-12)),
-                        proj
-                    )
-
-                turn_to_proj = torch.sum(torch.abs((proj - w) * x))
-                logit = gate(w, dev, p, delta_t, turn_to_proj)
-                prob = torch.sigmoid(logit).clamp(1e-6, 1 - 1e-6)
-                bern = torch.distributions.Bernoulli(probs=prob)
-                a_trade = bern.sample()
-                logprob_sum = logprob_sum + bern.log_prob(a_trade)
-
-                trade_prob_acc += float(prob.detach().cpu())
-                trade_count += float(a_trade.detach().cpu())
-
-                do_trade = (t == 0) or (float(a_trade.detach().cpu()) > 0.5)
-
-                if do_trade:
-                    cost = float(tcost) * turn_to_proj if tcost > 0 else torch.tensor(0.0, dtype=torch.float64, device=device)
-                    x_after = torch.clamp(x - cost, min=1e-12)
-                    x = x_after
-                    u = proj * x
-                #if float(a_trade.detach().cpu()) > 0.5:
-                #    cost = float(tcost) * turn_to_proj if tcost > 0 else torch.tensor(0.0, dtype=torch.float64, device=device)
-                #    x_after = torch.clamp(x - cost, min=1e-12)
-                #    x = x_after
-                #    u = proj * x
-
-                x = x + torch.dot(u, ret[t])
-
-                S_next = (S * torch.exp(logret[t])).detach().cpu().numpy()
-                lr_np = np.log(S_next / S.detach().cpu().numpy())
-                p, _ = wonham_filter_q_update(p, lr_np, dt, filt_params)
-                p = float(safe_clip_p(p))
-                S = torch.tensor(S_next, dtype=torch.float64, device=device)
-
-            xT = x
-            h = (xT - omega) ** 2 - (omega - float(z_target)) ** 2
-
-            h_list.append(h)
-            logprob_list.append(logprob_sum)
-
-            # REINFORCE: maximize h * log pi(a|s)
-            #loss_ep = -h.detach() * logprob_sum
-            #batch_loss = batch_loss + loss_ep
-
-            xT_sum += float(xT.detach().cpu())
-            p_trade_sum += trade_prob_acc / n_steps
-            n_trade_sum += trade_count / n_steps
-        #loss = batch_loss / float(batch_size)
-        
-        h_tensor = torch.stack(h_list)
-        baseline = h_tensor.mean().detach()
-        loss = torch.tensor(0.0, dtype=torch.float64, device=device)
-        for h, lp in zip(h_list, logprob_list):
-            loss = loss - (h.detach() - baseline) * lp
-        loss = loss / float(batch_size)
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-
-        if (it % 50) == 0 or it == 1:
-            rows.append({
-                "iter": it,
-                "loss": float(loss.detach().cpu()),
-                "xT": float(xT_sum / batch_size),
-                "omega": float(omega.detach().cpu()),
-                "mean_trade_prob": float(p_trade_sum / batch_size),
-                "mean_trade_rate": float(n_trade_sum / batch_size),
-            })
-            pd.DataFrame(rows).to_csv(outdir / "band_gate_train_metrics.csv", index=False)
-
-    torch.save({
-        "state_dict": gate.state_dict(),
-        "d": d,
-        "gate_hidden": int(gate_hidden),
-        "delta_init": float(delta_init),
-        "cubic_root": bool(cubic_root),
-        "gamma_mv": float(gamma_mv),
-    }, outdir / "band_gate.pt")
-
-    return gate
-
-def _train_band_gate_batched(
-    precomp: dict,
-    dt: float,
-    T_years: float,
-    z_target: float,
-    iters: int,
-    tcost: float,
-    delta_init: float,
-    lr: float,
-    gross_lev_max: float | None,
-    batch_size: int,
-    omega_fixed: float | None,
-    cubic_root: bool,
-    seed: int,
-    outdir: Path,
-    gate_hidden: int = 32,
-    device: str = "cpu",
-    alpha_floor: float = 0.05,
-    delta_floor: float = 0.05,
-):
-    """
-    Soft gate training:
-      alpha_t = sigmoid(gate(state_t))
-      w_new   = (1-alpha_t) * w + alpha_t * proj
-
-    This matches evaluation logic and avoids high-variance REINFORCE.
-    """
-    logret_all = precomp["logret"]
-    ret_all = precomp["ret"]
-    p_all = precomp["p"]
-    wstar_all = precomp["w_star"]
-    a2_all = precomp["a2_scale"]
-
-    T_all, d = logret_all.shape
-    n_steps = int(round(T_years / dt))
-    if n_steps <= 0:
-        raise ValueError(
-            f"T_years/dt must give at least 1 step, got T_years={T_years}, dt={dt}, n_steps={n_steps}"
-        )
-    if T_all <= n_steps + 5:
-        raise ValueError("train data too short for band gate training episode length")
-
-    rng = np.random.default_rng(seed)
-    dev = torch.device(device)
-
-    gate = BandGateNet(d=d, hidden=int(gate_hidden)).to(device=dev, dtype=torch.float64)
-    opt = optim.Adam(gate.parameters(), lr=float(lr))
-
-    omega = torch.tensor(
-        float(0.0 if omega_fixed is None else omega_fixed),
-        dtype=torch.float64,
-        device=dev,
-    )
-
-    batch_size = int(max(1, batch_size))
-    kappa13 = float((max(float(tcost), 1e-12)) ** (1.0 / 3.0))
-    c0_t = torch.full((1, d), float(delta_init), dtype=torch.float64, device=dev)
-
-    rows = []
-
-    for it in range(1, iters + 1):
-        starts = rng.integers(0, T_all - n_steps, size=batch_size)
-
-        ret_batch = np.stack([ret_all[s:s+n_steps] for s in starts], axis=0)          # (B,T,d)
-        p_batch = np.stack([p_all[s:s+n_steps] for s in starts], axis=0)              # (B,T)
-        wstar_batch = np.stack([wstar_all[s:s+n_steps] for s in starts], axis=0)      # (B,T,d)
-        a2_batch = np.stack([a2_all[s:s+n_steps] for s in starts], axis=0)            # (B,T,d)
-
-        ret_tape = torch.tensor(ret_batch, dtype=torch.float64, device=dev)
-        p_tape = torch.tensor(p_batch, dtype=torch.float64, device=dev)
-        wstar_tape = torch.tensor(wstar_batch, dtype=torch.float64, device=dev)
-        a2_tape = torch.tensor(a2_batch, dtype=torch.float64, device=dev)
-
-        x = torch.ones(batch_size, dtype=torch.float64, device=dev)
-        u = torch.zeros(batch_size, d, dtype=torch.float64, device=dev)
-
-        alpha_acc = torch.zeros(batch_size, dtype=torch.float64, device=dev)
-        alpha_sq_acc = torch.zeros(batch_size, dtype=torch.float64, device=dev)
-        trade_rate_acc = torch.zeros(batch_size, dtype=torch.float64, device=dev)
-        score_acc = torch.zeros(batch_size, dtype=torch.float64, device=dev)
-        outside_acc = torch.zeros(batch_size, dtype=torch.float64, device=dev)
-        turn_ratio_acc = torch.zeros(batch_size, dtype=torch.float64, device=dev)
-
-        for t in range(n_steps):
-            w = u / (x.unsqueeze(-1) + 1e-12)         # (B,d)
-            w_star = wstar_tape[:, t, :]              # (B,d)
-
-            if cubic_root:
-                delta_t = c0_t * kappa13 * a2_tape[:, t, :]
-            else:
-                delta_t = c0_t.expand(batch_size, -1)
-            delta_t = torch.clamp(delta_t, min=float(delta_floor))
-            dev_w = w - w_star
-            proj = w_star + torch.clamp(dev_w, -delta_t, +delta_t)
-
-            if (gross_lev_max is not None) and (gross_lev_max > 0):
-                lev = torch.sum(torch.abs(proj), dim=1, keepdim=True)
-                scale = torch.clamp(float(gross_lev_max) / (lev + 1e-12), max=1.0)
-                proj = proj * scale
-
-            # normalized turnover feature is stabler than raw dollars
-            turn_to_proj = torch.sum(torch.abs((proj - w) * x.unsqueeze(-1)), dim=1)   # (B,)
-            turn_ratio = turn_to_proj / (x + 1e-12)
-            dist_to_boundary_batch = torch.max(torch.abs(dev_w) / (delta_t + 1e-12), dim=1).values
-            score_batch = dist_to_boundary_batch - 1.0
-            outside_batch = (score_batch > 0.0).to(torch.float64)
-
-            logits = []
-            for b in range(batch_size):
-                logits.append(
-                    gate(
-                        w[b],
-                        dev_w[b],
-                        float(p_tape[b, t].item()),
-                        delta_t[b],
-                        turn_ratio[b],   # normalized feature
-                    )
-                )
-            logits = torch.stack(logits, dim=0)
-
-            alpha_raw = torch.sigmoid(logits).clamp(1e-4, 1.0 - 1e-4)
-            alpha = float(alpha_floor) + (1.0 - float(alpha_floor)) * alpha_raw
-
-            # force first intervention exactly as in evaluation
-            if t == 0:
-                alpha = torch.ones_like(alpha)
-
-            w_new = (1.0 - alpha.unsqueeze(-1)) * w + alpha.unsqueeze(-1) * proj
-
-            turn = torch.sum(torch.abs((w_new - w) * x.unsqueeze(-1)), dim=1)
-            cost = float(tcost) * turn if tcost > 0 else torch.zeros_like(turn)
-
-            x_after = torch.clamp(x - cost, min=1e-12)
-            x = x_after
-            u = w_new * x.unsqueeze(-1)
-
-            x = x + torch.sum(u * ret_tape[:, t, :], dim=1)
-
-            alpha_acc = alpha_acc + alpha.detach()
-            alpha_sq_acc = alpha_sq_acc + alpha.detach() ** 2
-            trade_rate_acc = trade_rate_acc + (alpha.detach() > 0.5).to(torch.float64)
-            score_acc = score_acc + score_batch.detach()
-            outside_acc = outside_acc + outside_batch.detach()
-            turn_ratio_acc = turn_ratio_acc + turn_ratio.detach()
-
-        h = (x - omega) ** 2 - (omega - float(z_target)) ** 2
-
-        # direct differentiable objective
-        loss = -torch.mean(h)
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-
-        if (it % 50) == 0 or it == 1:
-            mean_alpha = alpha_acc / n_steps
-            mean_alpha_sq = alpha_sq_acc / n_steps
-            alpha_std = torch.sqrt(torch.clamp(mean_alpha_sq - mean_alpha ** 2, min=0.0))
-
-            rows.append({
-                "iter": it,
-                "loss": float(loss.detach().cpu()),
-                "xT": float(x.detach().mean().cpu()),
-                "omega": float(omega.detach().cpu()),
-                "mean_alpha": float(mean_alpha.mean().cpu()),
-                "alpha_std": float(alpha_std.mean().cpu()),
-                "mean_trade_rate": float((trade_rate_acc / n_steps).mean().cpu()),
-                "mean_score": float((score_acc / n_steps).mean().cpu()),
-                "outside_rate": float((outside_acc / n_steps).mean().cpu()),
-                "mean_turn_ratio": float((turn_ratio_acc / n_steps).mean().cpu()),
-            })
-            pd.DataFrame(rows).to_csv(outdir / "band_gate_train_metrics.csv", index=False)
-
-    torch.save({
-        "state_dict": gate.state_dict(),
-        "d": d,
-        "gate_hidden": int(gate_hidden),
-        "delta_init": float(delta_init),
-        "cubic_root": bool(cubic_root),
-    }, outdir / "band_gate.pt")
-
-    return gate
-
 def train(mode: str, iters: int, seed: int, outdir: Path,
           alpha_theta: float, alpha_phi: float, alpha_w: float,
           Lambda: float, omega_update_every: int,
@@ -1262,10 +694,6 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
           save_agent: str | None = None,
           load_agent: str | None = None,
           band_soft_gate_tau: float | None = None,
-          band_gate: bool = False,
-          band_gate_hidden: int = 32,
-          band_gate_alpha_floor: float = 0.05,
-          band_gate_delta_floor: float = 0.05
           ):
     set_seed(seed)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1525,60 +953,27 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         })
         # (2) optional band learning under transaction cost on TRAIN tape (center fixed)
         c_final = None
-        gate_model = None
         if band_train:
             if df_train is None:
-                raise ValueError("band_train requires historical train_data_pkl (df_train)")
-            if band_gate:
-                precomp = _precompute_band_features_on_tape(
-                    df_train,
-                    filt_params,
-                    p_grid,
-                    w_star_grid,
-                    dt=dt,
-                    p0=cfg.p0,
-                    gamma_mv=1.0,
-                )
-                gate_model = _train_band_gate_batched(
-                    precomp=precomp,
-                    dt=dt,
-                    T_years=float(episode_T_years),
-                    z_target=float(cfg.z),
-                    iters=int(band_train_iters),
-                    tcost=float(band_tcost),
-                    delta_init=float(band_delta_init),
-                    lr=float(band_train_lr),
-                    gross_lev_max=band_gross_lev_max,
-                    batch_size=int(band_batch_size),
-                    omega_fixed=(float(agent.omega.detach().cpu()) if band_fix_omega else None),
-                    cubic_root=bool(band_cubic_root),
-                    seed=int(seed),
-                    outdir=outdir,
-                    gate_hidden=int(band_gate_hidden),
-                    device=("cuda" if torch.cuda.is_available() else "cpu"),
-                    alpha_floor=float(band_gate_alpha_floor),
-                    delta_floor=float(band_gate_delta_floor),
-                )
-            else:
-                c_final = _train_band_delta(
-                    df_train, filt_params,
-                    p_grid, w_star_grid,
-                    dt=dt, T_years=float(episode_T_years),
-                    z_target=float(cfg.z),
-                    iters=int(band_train_iters),
-                    tcost=float(band_tcost),
-                    delta_init=float(band_delta_init),
-                    lr=float(band_train_lr),
-                    gross_lev_max=band_gross_lev_max,
-                    batch_size=int(band_batch_size),
-                    omega_fixed=(float(agent.omega.detach().cpu()) if band_fix_omega else None),
-                    cubic_root=bool(band_cubic_root),
-                    seed=int(seed),
-                    outdir=outdir,
-                    p0=cfg.p0,
-                    gamma_mv=1.0,
-                    soft_gate_tau=band_soft_gate_tau,
-                )
+                raise ValueError("band_train requires historical train_data_pkl (df_train) in current minimal implementation")
+            c_final = _train_band_delta(
+                df_train, filt_params,
+                p_grid, w_star_grid,
+                dt=dt, T_years=float(episode_T_years),
+                z_target=float(cfg.z),
+                iters=int(band_train_iters),
+                tcost=float(band_tcost),
+                delta_init=float(band_delta_init),
+                lr=float(band_train_lr),
+                gross_lev_max=band_gross_lev_max,
+                batch_size=int(band_batch_size),
+                omega_fixed=(float(agent.omega.detach().cpu()) if band_fix_omega else None),
+                cubic_root=bool(band_cubic_root),
+                seed=int(seed),
+                outdir=outdir,
+                gamma_mv=1.0,
+                soft_gate_tau=band_soft_gate_tau,
+            )
         # (3) band overlay: evaluate fixed and at most one learned variant on the SAME eval_df
         if band_overlay:
             if p_grid is None or w_star_grid is None:
@@ -1611,25 +1006,8 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
                             learned_payload = {"kind": "delta", "value": z["delta"].astype(float).reshape(-1,)}
                     except Exception:
                         learned_payload = None
-            if gate_model is not None:
-                _, X_band_learned, gross_band_learned, trade_prob_path = _backtest_band_gate_on_logret(
-                    eval_df, filt_params, p_grid, w_star_grid,
-                    gate_model=gate_model,
-                    dt=dt, x0=cfg.x0,
-                    tcost=float(band_tcost),
-                    gross_lev_max=band_gross_lev_max,
-                    p0=cfg.p0,
-                    delta_init=float(band_delta_init),
-                    cubic_root=bool(band_cubic_root),
-                    gamma_mv=1.0,
-                    alpha_floor=float(band_gate_alpha_floor),
-                    delta_floor=float(band_gate_delta_floor),
-                )
-                bench_df["X_BAND_learned"] = X_band_learned
-                bench_df["gross_BAND_learned"] = gross_band_learned
-                bench_df["trade_prob_BAND_learned"] = np.r_[np.nan, trade_prob_path]
 
-            elif learned_payload is not None:
+            if learned_payload is not None:
                 if learned_payload["kind"] == "c":
                     _, X_band_learned, gross_band_learned = _backtest_band_on_logret(
                         eval_df, filt_params, p_grid, w_star_grid,
@@ -1810,23 +1188,6 @@ def main():
                     help="If 1: keep omega fixed at center RL's omega during band training.")
     ap.add_argument("--band_soft_gate_tau",type=float,default=None,help="Soft gate temperature for band policy. ""If None or <=0, use hard inside/outside rule. "
          "Typical values: 0.02 ~ 0.10")
-    ap.add_argument("--band_gate", action="store_true",
-                help="Use 2a gate learner: Bernoulli trade/no-trade with fixed projection target.")
-    ap.add_argument("--band_gate_hidden", type=int, default=32,
-                help="Hidden width for band gate network.")
-    ap.add_argument(
-        "--band_gate_alpha_floor",
-        type=float,
-        default=0.05,
-        help="Minimum intervention strength floor for soft gate alpha. "
-            "alpha = alpha_floor + (1-alpha_floor)*sigmoid(logit)."
-    )
-    ap.add_argument(
-        "--band_gate_delta_floor",
-        type=float,
-        default=0.05,
-        help="Minimum per-asset band half-width used in gate learner/backtest."
-    )
 
 
 
@@ -1855,7 +1216,7 @@ def main():
               band_delta=args.band_delta,
               band_tcost=args.band_tcost,
               band_gross_lev_max=args.band_gross_lev_max,
-              band_train= args.band_train,
+              band_train= True,#args.band_train,
               band_train_iters=args.band_train_iters,
               band_train_lr=args.band_train_lr,
               band_delta_init=args.band_delta_init,
@@ -1865,10 +1226,6 @@ def main():
               save_agent=args.save_agent,
               load_agent=args.load_agent,
               band_soft_gate_tau=args.band_soft_gate_tau,
-              band_gate=args.band_gate,
-              band_gate_hidden=args.band_gate_hidden,
-              band_gate_alpha_floor=args.band_gate_alpha_floor,
-              band_gate_delta_floor=args.band_gate_delta_floor,
               )
 
 if __name__ == "__main__":
