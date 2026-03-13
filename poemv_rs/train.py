@@ -1,12 +1,12 @@
 from __future__ import annotations
-import argparse, os
+import argparse
 import numpy as np
 import pandas as pd
-import math
+import torch
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-from .env import RSGBMParams, RSGBMParams2, EpisodeConfig, RSGBMEnv,simulate_price_only
+from .env import RSGBMParams, EpisodeConfig, RSGBMEnv, simulate_price_only
 from .filtering import FilterParams, wonham_filter_q_update
 
 from .heuristic import HeuristicThresholds, label_bull_bear_from_drawdowns, estimate_env_params_from_labeled_returns
@@ -55,6 +55,7 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
           alpha_theta: float, alpha_phi: float, alpha_w: float,
           Lambda: float, omega_update_every: int,
           episode_T_years: float = 10.0, dt: float = 1/252, a_max: float = 2.0,
+          r: float = 0.01,
           ):
 
     set_seed(seed)
@@ -65,7 +66,7 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         mu1=np.array([0.25, 0.18]), mu2=np.array([-0.73, -0.40]),
         Sigma1=np.array([[0.22**2, 0.22*0.18*0.3],[0.22*0.18*0.3, 0.18**2]]),
         Sigma2=np.array([[0.22**2, 0.22*0.18*0.5],[0.22*0.18*0.5, 0.18**2]]),
-        lam1=0.36, lam2=2.89, r=0.0)
+        lam1=0.36, lam2=2.89, r=r)
 
     if mode == "true_params":
         filt_params = FilterParams(mu1=true_params.mu1, mu2=true_params.mu2, Sigma1=true_params.Sigma1, Sigma2=true_params.Sigma2,
@@ -84,6 +85,7 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
     cfg = TrainConfig(T_years=episode_T_years, dt=dt, x0=1.0, s0=1.0, p0=0.5, z=1.5,
                         Lambda=Lambda, alpha_theta=alpha_theta, alpha_phi=alpha_phi, alpha_w=alpha_w,
                         omega_update_every=omega_update_every, a_max=a_max,
+                        r=r,
                         )
     agent = POEMVAgent(cfg)
 
@@ -92,6 +94,31 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
     last_mean_xT_window = float("nan")
     last_gap = float("nan")
     last_domega = 0.0
+
+    def _episode_position_stats(traj):
+        """
+        Compute average gross leverage, cash weight, and absolute action size
+        over one episode from realized risky positions u_k and wealth x_k.
+
+        gross_lev_k = sum_i |u_{k,i}| / |x_k|
+        cash_w_k    = 1 - sum_i u_{k,i}/x_k
+        abs_u_k     = mean_i |u_{k,i}|
+        """
+        u = np.asarray(traj["u"], dtype=float)              # (n, d)
+        x = np.asarray(traj["x"], dtype=float)[:-1]         # (n,)
+        denom = np.maximum(np.abs(x), 1e-12)[:, None]       # (n,1)
+        w = u / denom                                       # risky weights
+
+        gross_lev = np.sum(np.abs(w), axis=1)               # (n,)
+        cash_w = 1.0 - np.sum(w, axis=1)                    # (n,)
+        abs_u = np.mean(np.abs(u), axis=1)                  # (n,)
+        return {
+            "avg_gross_leverage": float(np.mean(gross_lev)),
+            "avg_cash_weight": float(np.mean(cash_w)),
+            "avg_abs_action": float(np.mean(abs_u)),
+            "max_gross_leverage": float(np.max(gross_lev)),
+            "min_cash_weight": float(np.min(cash_w)),
+        }
 
     for m in range(1, iters+1):
         # One episode: simulate environment with TRUE parameters (market), but filter with selected parameters.
@@ -124,8 +151,6 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             t_arr[k+1] = obs["t"]
             x_arr[k+1] = obs["X"]
             p_arr[k+1] = p
-            #logp_arr[k] = float(logprob.detach().cpu())
-            #ent_arr[k] = float(entropy.detach().cpu())
             S_prev = S_now
             if done:
                 break
@@ -139,15 +164,10 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
 
         traj = dict(t=t_arr, x=x_arr, p=p_arr, u=u_arr, u_raw=u_raw_arr, a_max=a_max)
         loss_c, loss_a = agent.update_from_episode(traj)
+        pos_stats = _episode_position_stats(traj)
 
         xT = float(x_arr[-1])
         last_terminals.append(xT)
-        #if len(last_terminals) > omega_update_every:
-        #    last_terminals = last_terminals[-omega_update_every:]
-
-        #if (m % omega_update_every) == 0:
-        #    agent.update_omega(float(np.mean(last_terminals)))
-        # keep a rolling window used for omega update
         if len(last_terminals) > omega_update_every:
             last_terminals = last_terminals[-omega_update_every:]
 
@@ -172,6 +192,11 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             domega=last_domega,
             loss_critic=loss_c,
             loss_actor=loss_a,
+            avg_gross_leverage=pos_stats["avg_gross_leverage"],
+            avg_cash_weight=pos_stats["avg_cash_weight"],
+            avg_abs_action=pos_stats["avg_abs_action"],
+            max_gross_leverage=pos_stats["max_gross_leverage"],
+            min_cash_weight=pos_stats["min_cash_weight"],
             **phi
         ))
 
@@ -200,11 +225,25 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             if isinstance(o, (np.floating, np.integer)):
                 return o.item()
             raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
-        json.dump(dict(mode=mode, seed=seed, iters=iters, Lambda=Lambda,
-                       alpha_theta=alpha_theta, alpha_phi=alpha_phi, alpha_w=alpha_w,
-                       omega_update_every=omega_update_every,
-                       true_params=true_params.__dict__, filter_params=filt_params.__dict__,
-                       estimated_params=est_params.__dict__), f, indent=2, default=_json_default)
+        json.dump(dict(
+            mode=mode, seed=seed, iters=iters,
+            T=episode_T_years, dt=dt, a_max=a_max, r=r,
+            x0=cfg.x0, p0=cfg.p0, z=cfg.z,
+            Lambda=Lambda,
+            alpha_theta=alpha_theta, alpha_phi=alpha_phi, alpha_w=alpha_w,
+            omega_update_every=omega_update_every,
+            true_params=true_params.__dict__,
+            filter_params=filt_params.__dict__,
+            estimated_params=est_params.__dict__,
+        ), f, indent=2, default=_json_default)
+    torch.save(
+        {
+            "vf_state_dict": agent.vf.state_dict(),
+            "pi_state_dict": agent.pi.state_dict(),
+            "omega": float(agent.omega.detach().cpu()),
+        },
+        outdir / "checkpoint.pt",
+    )
 
 def main():
     ap = argparse.ArgumentParser()
@@ -213,16 +252,18 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--outdir", type=str, default="runs/poemv_rs")
     ap.add_argument("--Lambda", type=float, default=1.0)
-    ap.add_argument("--alpha_theta", type=float, default=1e-13)
+    ap.add_argument("--alpha_theta", type=float, default=1e-5)
     ap.add_argument("--alpha_phi", type=float, default=1e-4)
     ap.add_argument("--alpha_w", type=float, default=1e-3)
     ap.add_argument("--omega_update_every", type=int, default=10)
     ap.add_argument("--T", type=float, default=10.0)
     ap.add_argument("--dt", type=float, default=1/252)
     ap.add_argument("--a_max", type=float, default=4.0)
+    ap.add_argument("--r", type=float, default=0.01)
     args = ap.parse_args()
     train(args.mode, args.iters, args.seed, Path(args.outdir), args.alpha_theta, args.alpha_phi, args.alpha_w,
           args.Lambda, args.omega_update_every, episode_T_years=args.T, dt=args.dt,a_max=args.a_max,
+          r=args.r,
           )
 
 if __name__ == "__main__":

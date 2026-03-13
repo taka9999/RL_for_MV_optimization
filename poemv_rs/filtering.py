@@ -11,7 +11,7 @@ class FilterParams:
     Sigma2: np.ndarray     # (2,2)
     lam1: float
     lam2: float
-    r: float = 0.0
+    r: float = 0.01
 
 def _mvn_logpdf(y: np.ndarray, mean: np.ndarray, cov: np.ndarray) -> float:
     y = np.asarray(y, dtype=float).reshape(-1)

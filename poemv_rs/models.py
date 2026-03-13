@@ -47,31 +47,93 @@ class PolyValue(nn.Module):
         return out
 
 class POEMVPolicy(nn.Module):
-    """2-asset independent Gaussian policy; per-asset (phi1, phi2, phi3)."""
-    def __init__(self):
+    """2-asset independent Gaussian policy; per-asset (phi1, phi2, phi3).
+    Mean uses a regime-belief-weighted excess-drift signal passed through (sigma^T)^-1.
+    Covariance is scaled as 0.5 * Lambda * f(t,p) * (sigma sigma^T)^-1 when the
+    learnable SPD matrix is initialized to identity, matching the Appendix-A structure.
+    """
+    def __init__(self, n_assets: int = 2):
         super().__init__()
-        # shape (2,3): rows are assets, cols are (phi1,phi2,phi3)
-        self.phi = nn.Parameter(torch.zeros((2,3), dtype=torch.float64))
+        self.n_assets = int(n_assets)
+        # rows are assets, cols are (phi1, phi2)
+        self.phi = nn.Parameter(torch.zeros((self.n_assets, 2), dtype=torch.float64))
+        # unconstrained lower-triangular parameter for a learnable SPD covariance core
+        self.cov_tril_unconstrained = nn.Parameter(torch.eye(self.n_assets, dtype=torch.float64))
 
-    def dist_params(self, x: torch.Tensor, omega: torch.Tensor, p: torch.Tensor, dlnf_dp: torch.Tensor,
-                    f: torch.Tensor, Lambda: float,sigma: float):
-        # x, p, f are (n,) or (1,)
-        # returns mean:(n,2), std:(n,2)
-        inv_sigma2 = 1.0 / (sigma * sigma)  # use a scalar scale for both assets (keeps config simple)
-        # mean = -(x-omega) * [phi1*(p - (f_p/f) p(1-p)) + phi2]
+    def _posterior_moments(
+        self,
+        p: torch.Tensor,
+        mu1: torch.Tensor,
+        mu2: torch.Tensor,
+        Sigma1: torch.Tensor,
+        Sigma2: torch.Tensor,
+        r: float,
+    ):
+        p_col = p.unsqueeze(-1)
+        mu_bar = p_col * mu1 + (1.0 - p_col) * mu2
+        excess_mu = mu_bar - float(r)
+        p_mat = p.unsqueeze(-1).unsqueeze(-1)
+        Sigma_bar = p_mat * Sigma1 + (1.0 - p_mat) * Sigma2
+        eye = torch.eye(self.n_assets, dtype=p.dtype, device=p.device).unsqueeze(0)
+        Sigma_bar = Sigma_bar + 1e-10 * eye
+        return excess_mu, Sigma_bar
+
+    def _spd_core(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        raw = torch.tril(self.cov_tril_unconstrained.to(dtype=dtype, device=device))
+        diag = torch.diagonal(raw, dim1=-2, dim2=-1)
+        tril = raw - torch.diag_embed(diag) + torch.diag_embed(torch.exp(diag))
+        return tril @ tril.transpose(-1, -2)
+
+    def dist(
+        self,
+        x: torch.Tensor,
+        omega: torch.Tensor,
+        p: torch.Tensor,
+        dlnf_dp: torch.Tensor,
+        f: torch.Tensor,
+        Lambda: float,
+        mu1: torch.Tensor,
+        mu2: torch.Tensor,
+        Sigma1: torch.Tensor,
+        Sigma2: torch.Tensor,
+        r: float,
+    ):
+        if x.ndim == 0:
+            x = x.unsqueeze(0)
+        if p.ndim == 0:
+            p = p.unsqueeze(0)
+        if dlnf_dp.ndim == 0:
+            dlnf_dp = dlnf_dp.unsqueeze(0)
+        if f.ndim == 0:
+            f = f.unsqueeze(0)
+
+        mu1 = torch.as_tensor(mu1, dtype=x.dtype, device=x.device).view(1, self.n_assets)
+        mu2 = torch.as_tensor(mu2, dtype=x.dtype, device=x.device).view(1, self.n_assets)
+        Sigma1 = torch.as_tensor(Sigma1, dtype=x.dtype, device=x.device).view(1, self.n_assets, self.n_assets)
+        Sigma2 = torch.as_tensor(Sigma2, dtype=x.dtype, device=x.device).view(1, self.n_assets, self.n_assets)
+
+        excess_mu, Sigma_bar = self._posterior_moments(p, mu1, mu2, Sigma1, Sigma2, r)
+        chol = torch.linalg.cholesky(Sigma_bar)
         adj = p - dlnf_dp * p * (1.0 - p)
-        phi1 = self.phi[:,0]  # (2,)
-        phi2 = self.phi[:,1]  # (2,)
-        phi3 = self.phi[:,2]  # (2,)
+        signal = self.phi[:, 0].view(1, self.n_assets) * (adj.unsqueeze(-1) * excess_mu) + self.phi[:, 1].view(1, self.n_assets) * excess_mu
+        sigma_t_inv_signal = torch.linalg.solve_triangular(
+            chol.transpose(-1, -2), signal.unsqueeze(-1), upper=True
+        ).squeeze(-1)
+        mean = -(x - omega).unsqueeze(-1) * sigma_t_inv_signal
 
-        base = (-(x - omega) * (adj)).unsqueeze(-1)  # (n,1)
-        mean = inv_sigma2 * (base * phi1.view(1,2) + (-(x-omega)).unsqueeze(-1) * phi2.view(1,2))
+        spd_core = self._spd_core(dtype=x.dtype, device=x.device)
+        inv_sigma_t = torch.linalg.solve_triangular(
+            chol.transpose(-1, -2),
+            torch.eye(self.n_assets, dtype=x.dtype, device=x.device).unsqueeze(0).expand_as(Sigma_bar),
+            upper=True,
+        )
 
-        Lam = torch.as_tensor(Lambda, dtype=x.dtype, device=x.device)
-        var = inv_sigma2 * (Lam * torch.exp(phi3.view(1,2)) * f.unsqueeze(-1))
-        var = var.clamp(min=1e-24, max=100.0)
-        std = torch.sqrt(var)  # (n,2)
-        return mean, std
+        lam = torch.as_tensor(Lambda, dtype=x.dtype, device=x.device)
+        cov = 0.5 * lam * f.view(-1, 1, 1) * (inv_sigma_t @ spd_core.unsqueeze(0) @ inv_sigma_t.transpose(-1, -2))
+        eye = torch.eye(self.n_assets, dtype=x.dtype, device=x.device).unsqueeze(0)
+        cov = 0.5 * (cov + cov.transpose(-1, -2)) + 1e-10 * eye
+
+        return torch.distributions.MultivariateNormal(loc=mean, covariance_matrix=cov)
 
 def value_fn(t: torch.Tensor, x: torch.Tensor, p: torch.Tensor, omega: torch.Tensor, z: float,
              vf: PolyValue):

@@ -4,7 +4,6 @@ import numpy as np
 
 @dataclass
 class RSGBMParams:
-    # 2-asset: mu_i is (2,), Sigma_i is (2,2)
     mu1: np.ndarray = np.array([0.25, 0.18], dtype=float)
     mu2: np.ndarray = np.array([-0.73, -0.40], dtype=float)
     Sigma1: np.ndarray = np.array([[0.22**2, 0.22*0.18*0.3],
@@ -13,7 +12,7 @@ class RSGBMParams:
                                    [0.22*0.18*0.5, 0.18**2]], dtype=float)
     lam1: float = 0.36   # intensity 1->2
     lam2: float = 2.89   # intensity 2->1
-    r: float = 0.0
+    r: float = 0.01
 
 @dataclass
 class RSGBMParams2:
@@ -27,7 +26,7 @@ class RSGBMParams2:
     Sigma2: np.ndarray
     lam1: float = 0.36
     lam2: float = 2.89
-    r: float = 0.0
+    r: float = 0.01
 
 @dataclass
 class EpisodeConfig:
@@ -41,15 +40,17 @@ class EpisodeConfig:
     seed: int = 0
 
 class RSGBMEnv:
-    """Simulate price and wealth under hidden 2-state CTMC regime.
+    """
+    Simulate price and discounted wealth under hidden 2-state CTMC regime.
 
     Regime I_t in {1,2}, with transition intensities:
       1 -> 2: lam1
       2 -> 1: lam2
     Risky price:
       d log S = (mu_{I_t} - 0.5 diag(Sigma_{I_t})) dt + L_{I_t} dB,  Sigma = L L^T
-    Wealth (discounted, r=0 by default):
-      X_{k+1} = X_k + u_k^T * ((S_{k+1}-S_k)/S_k)
+    Discounted wealth:
+      X_{k+1} = X_k + u_k^T * (exp(d log S_k - r dt) - 1)
+    where u_k is the vector of discounted dollar amounts invested in the risky assets.
     """
 
     def __init__(self, params: RSGBMParams, cfg: EpisodeConfig):
@@ -73,8 +74,7 @@ class RSGBMEnv:
     def _mu_Sigma(self, I: int):
         if I == 1:
             return np.asarray(self.params.mu1, dtype=float), np.asarray(self.params.Sigma1, dtype=float)
-        else:
-            return np.asarray(self.params.mu2, dtype=float), np.asarray(self.params.Sigma2, dtype=float)
+        return np.asarray(self.params.mu2, dtype=float), np.asarray(self.params.Sigma2, dtype=float)
 
     def step(self, u: np.ndarray):
         dt = self.cfg.dt
@@ -95,21 +95,20 @@ class RSGBMEnv:
         dlogS = (mu - 0.5*np.diag(Sigma)) * dt + (L @ (np.sqrt(dt)*eps))
         S_next = self.S * np.exp(dlogS)
 
-        # wealth update (discounted; if r!=0 you can discount explicitly)
-        ret = (S_next - self.S) / self.S     # (2,)
-        X_next = self.X + float(np.dot(u, ret))
+        discounted_ret = np.exp(dlogS - self.params.r * dt) - 1.0
+        X_next = self.X + float(np.dot(u, discounted_ret))
 
         # stop immediately if non-finite shows up (prevents silent CSV corruption)
         if not np.isfinite(X_next):
             raise FloatingPointError(
-                f"X_next became non-finite: X={self.X}, u={u}, ret={ret}, S={self.S}, S_next={S_next}"
+                f"X_next became non-finite: X={self.X}, u={u}, discounted_ret={discounted_ret}, S={self.S}, S_next={S_next}"
             )
 
         self.S, self.X = np.array(S_next, dtype=float), float(X_next)
         self.t += dt
         self.k += 1
-        done = (self.k >= self.n_steps)
-        return self._obs(), ret, done
+        done = self.k >= self.n_steps
+        return self._obs(), discounted_ret, done
 
     def _obs(self):
         return {
