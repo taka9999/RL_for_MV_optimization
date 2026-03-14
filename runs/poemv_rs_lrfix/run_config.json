@@ -1,7 +1,7 @@
 {
   "mode": "true_params",
   "seed": 0,
-  "iters": 2000,
+  "iters": 500,
   "T": 5.0,
   "dt": 0.003968253968253968,
   "a_max": 2.0,
@@ -10,10 +10,13 @@
   "p0": 0.5,
   "z": 1.5,
   "Lambda": 0.1,
-  "alpha_theta": 1e-05,
-  "alpha_phi": 3e-05,
+  "alpha_theta": 0.001,
+  "alpha_phi": 0.001,
   "alpha_w": 0.005,
-  "omega_update_every": 10,
+  "omega_update_every": 20,
+  "critic_steps": 5,
+  "advantage_norm_eps": 1e-08,
+  "omega_ema_beta": 0.9,
   "true_params": {
     "mu1": [
       0.25,

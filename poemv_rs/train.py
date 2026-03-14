@@ -56,6 +56,9 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
           Lambda: float, omega_update_every: int,
           episode_T_years: float = 10.0, dt: float = 1/252, a_max: float = 2.0,
           r: float = 0.01,
+          critic_steps: int = 5,
+          advantage_norm_eps: float = 1e-8,
+          omega_ema_beta: float = 0.9,
           ):
 
     set_seed(seed)
@@ -86,6 +89,9 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
                         Lambda=Lambda, alpha_theta=alpha_theta, alpha_phi=alpha_phi, alpha_w=alpha_w,
                         omega_update_every=omega_update_every, a_max=a_max,
                         r=r,
+                        critic_steps=critic_steps,
+                        advantage_norm_eps=advantage_norm_eps,
+                        omega_ema_beta=omega_ema_beta,
                         )
     agent = POEMVAgent(cfg)
 
@@ -232,6 +238,9 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             Lambda=Lambda,
             alpha_theta=alpha_theta, alpha_phi=alpha_phi, alpha_w=alpha_w,
             omega_update_every=omega_update_every,
+            critic_steps=critic_steps,
+            advantage_norm_eps=advantage_norm_eps,
+            omega_ema_beta=omega_ema_beta,
             true_params=true_params.__dict__,
             filter_params=filt_params.__dict__,
             estimated_params=est_params.__dict__,
@@ -260,10 +269,16 @@ def main():
     ap.add_argument("--dt", type=float, default=1/252)
     ap.add_argument("--a_max", type=float, default=4.0)
     ap.add_argument("--r", type=float, default=0.01)
+    ap.add_argument("--critic_steps", type=int, default=5)
+    ap.add_argument("--advantage_norm_eps", type=float, default=1e-8)
+    ap.add_argument("--omega_ema_beta", type=float, default=0.9)
     args = ap.parse_args()
     train(args.mode, args.iters, args.seed, Path(args.outdir), args.alpha_theta, args.alpha_phi, args.alpha_w,
           args.Lambda, args.omega_update_every, episode_T_years=args.T, dt=args.dt,a_max=args.a_max,
           r=args.r,
+          critic_steps=args.critic_steps,
+          advantage_norm_eps=args.advantage_norm_eps,
+          omega_ema_beta=args.omega_ema_beta,
           )
 
 if __name__ == "__main__":

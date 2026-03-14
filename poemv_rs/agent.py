@@ -30,6 +30,9 @@ class TrainConfig:
     alpha_phi: float = 1e-4
     omega_init: float = 0.0
     omega_update_every: int = 10
+    critic_steps: int = 5
+    advantage_norm_eps: float = 1e-8
+    omega_ema_beta: float = 0.9
     grad_clip: float = 1.0
     #phi3_init: float = -3.0
     #phi3_min: float = -10.0
@@ -53,6 +56,7 @@ class POEMVAgent:
         self.mu2_t = torch.as_tensor(cfg.mu2, dtype=cfg.dtype, device=cfg.device)
         self.Sigma1_t = torch.as_tensor(cfg.Sigma1, dtype=cfg.dtype, device=cfg.device)
         self.Sigma2_t = torch.as_tensor(cfg.Sigma2, dtype=cfg.dtype, device=cfg.device)
+        self.mean_xT_ema = None
     
     def _h_terminal(self, xT: torch.Tensor) -> torch.Tensor:
         return (xT - self.omega)**2 - (self.omega - self.cfg.z)**2
@@ -88,7 +92,6 @@ class POEMVAgent:
 
     def update_from_episode(self, traj):
         cfg = self.cfg
-        t = torch.tensor(traj["t"], dtype=cfg.dtype, device=cfg.device)   # (n+1,)
         t = torch.tensor(traj["t"], dtype=cfg.dtype, device=cfg.device)
         x = torch.tensor(traj["x"], dtype=cfg.dtype, device=cfg.device)
         p = torch.tensor(traj["p"], dtype=cfg.dtype, device=cfg.device)
@@ -128,19 +131,22 @@ class POEMVAgent:
         G = torch.flip(torch.cumsum(torch.flip(entropy, dims=[0]), dim=0), dims=[0]) * dt
         Y = hT - cfg.Lambda * G
 
-        V0, _ = value_fn(t0, x0, p0, self.omega, cfg.z, self.vf)          # (n,)
-        self.opt_theta.zero_grad(set_to_none=True)
-        loss_critic = 0.5 * ((Y.detach() - V0)**2).mean()
-        loss_critic.backward()
-        # gradient clipping to prevent explosions
-        nn_utils.clip_grad_norm_(self.vf.parameters(), max_norm=cfg.grad_clip)
-        self.opt_theta.step()
+        loss_critic = None
+        for _ in range(int(cfg.critic_steps)):
+            V0, _ = value_fn(t0, x0, p0, self.omega, cfg.z, self.vf)          # (n,)
+            self.opt_theta.zero_grad(set_to_none=True)
+            loss_critic = 0.5 * ((Y.detach() - V0)**2).mean()
+            loss_critic.backward()
+            # gradient clipping to prevent explosions
+            nn_utils.clip_grad_norm_(self.vf.parameters(), max_norm=cfg.grad_clip)
+            self.opt_theta.step()
 
         # --- actor: REINFORCE + baseline ---
         # advantage A_k = Y_k - V_theta(t_k, ...)
         with torch.no_grad():
             Vb, _ = value_fn(t0, x0, p0, self.omega, cfg.z, self.vf)
-            A = (Y - Vb)                            # (n,)
+            A = (Y - Vb)
+            A = (A - A.mean()) / (A.std(unbiased=False) + cfg.advantage_norm_eps)
         
         f_actor = self.vf.f(t0, p0).detach()
         dlnf_actor = self.vf.dlnf_dp(t0, p0).detach()
@@ -172,9 +178,14 @@ class POEMVAgent:
     def update_omega(self, mean_terminal_wealth: float):
         # dual ascent: omega <- omega + alpha_w (E[X_T]-z)
         cfg = self.cfg
+        mean_terminal_wealth = float(mean_terminal_wealth)
+        if self.mean_xT_ema is None:
+            self.mean_xT_ema = mean_terminal_wealth
+        else:
+            beta = float(cfg.omega_ema_beta)
+            self.mean_xT_ema = beta * self.mean_xT_ema + (1.0 - beta) * mean_terminal_wealth
         self.omega = self.omega - cfg.alpha_w * torch.tensor(
-            (mean_terminal_wealth - cfg.z), dtype=cfg.dtype, device=cfg.device
-        )
+            (self.mean_xT_ema - cfg.z), dtype=cfg.dtype, device=cfg.device)
     
     def phi_values(self):
         v = self.pi.phi.detach().cpu().numpy()
