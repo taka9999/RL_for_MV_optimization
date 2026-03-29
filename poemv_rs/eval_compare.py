@@ -20,14 +20,9 @@ def default_true_params(r: float = 0.01) -> RSGBMParams:
     return RSGBMParams(
         mu1=np.array([0.25, 0.18], dtype=float),
         mu2=np.array([-0.73, -0.40], dtype=float),
-        Sigma1=np.array(
+        Sigma=np.array(
             [[0.22**2, 0.22 * 0.18 * 0.3],
              [0.22 * 0.18 * 0.3, 0.18**2]],
-            dtype=float,
-        ),
-        Sigma2=np.array(
-            [[0.22**2, 0.22 * 0.18 * 0.5],
-             [0.22 * 0.18 * 0.5, 0.18**2]],
             dtype=float,
         ),
         lam1=0.36,
@@ -43,8 +38,8 @@ def stationary_bull_prob(params: RSGBMParams) -> float:
 def unconditional_moments(params: RSGBMParams) -> Tuple[np.ndarray, np.ndarray]:
     pbull = stationary_bull_prob(params)
     mu_bar = pbull * np.asarray(params.mu1, float) + (1.0 - pbull) * np.asarray(params.mu2, float)
-    sigma_bar = pbull * np.asarray(params.Sigma1, float) + (1.0 - pbull) * np.asarray(params.Sigma2, float)
-    return mu_bar, sigma_bar
+    sigma = np.asarray(params.Sigma, float)
+    return mu_bar, sigma
 
 
 def target_excess_return_per_year(x0: float, z: float, T_years: float) -> float:
@@ -66,6 +61,17 @@ def load_checkpoint(ckpt_path: Path, device: str = "cpu") -> Dict:
         raise ValueError("Checkpoint must be a dict with vf/pi/omega fields.")
     return ckpt
 
+def _params_from_run_config(run_cfg: Dict, r: float) -> RSGBMParams:
+    default_params = default_true_params(r=r)
+    src = run_cfg.get("true_params") or run_cfg.get("filter_params") or {}
+    return RSGBMParams(
+        mu1=np.asarray(src.get("mu1", default_params.mu1), dtype=float),
+        mu2=np.asarray(src.get("mu2", default_params.mu2), dtype=float),
+        Sigma=np.asarray(src.get("Sigma", default_params.Sigma), dtype=float),
+        lam1=float(src.get("lam1", default_params.lam1)),
+        lam2=float(src.get("lam2", default_params.lam2)),
+        r=float(src.get("r", r)),
+    )
 
 def build_agent_from_checkpoint(
     ckpt_path: Path,
@@ -80,20 +86,31 @@ def build_agent_from_checkpoint(
     run_cfg = load_run_config(run_dir)
     ckpt = load_checkpoint(ckpt_path, device=device)
 
+    default_params = default_true_params(r=r)
+    mu1 = np.asarray(run_cfg.get("mu1", default_params.mu1), dtype=float)
+    mu2 = np.asarray(run_cfg.get("mu2", default_params.mu2), dtype=float)
+    Sigma = np.asarray(run_cfg.get("Sigma", default_params.Sigma), dtype=float)
+    cfg_params = _params_from_run_config(run_cfg, r=r)
     train_cfg = TrainConfig(
-        T_years=T_years,
-        dt=dt,
-        x0=1.0,
+        T_years=float(run_cfg.get("T", T_years)),
+        dt=float(run_cfg.get("dt", dt)),
+        x0=float(run_cfg.get("x0", 1.0)),
         s0=1.0,
-        p0=0.5,
-        a_max=a_max,
-        z=z,
+        p0=float(run_cfg.get("p0", 0.5)),
+        a_max=run_cfg.get("a_max", a_max),
+        cap_mode=str(run_cfg.get("cap_mode", "none")),
+        z=float(run_cfg.get("z", z)),
         Lambda=float(run_cfg.get("Lambda", 1.0)),
-        r=r,
+        r=float(run_cfg.get("r", r)),
         alpha_theta=float(run_cfg.get("alpha_theta", 1e-5)),
         alpha_phi=float(run_cfg.get("alpha_phi", 1e-4)),
         alpha_w=float(run_cfg.get("alpha_w", 1e-3)),
         omega_update_every=int(run_cfg.get("omega_update_every", 10)),
+        critic_steps=int(run_cfg.get("critic_steps", 10)),
+        omega_ema_beta=float(run_cfg.get("omega_ema_beta", 0.9)),
+        mu1=cfg_params.mu1,
+        mu2=cfg_params.mu2,
+        Sigma=cfg_params.Sigma,
         device=device,
         dtype=torch.float64,
     )
@@ -235,9 +252,12 @@ def static_action_from_weights(weights: np.ndarray, wealth: float) -> np.ndarray
     return np.asarray(weights, dtype=float) * float(wealth)
 
 
-def rl_action(agent: POEMVAgent, t: float, x: float, p: float) -> np.ndarray:
-    u, _, _ = agent.act(t, x, p)
-    return np.asarray(u, dtype=float)
+def rl_action(agent: POEMVAgent, t: float, x: float, p: float, deterministic: bool = True) -> np.ndarray:
+    if deterministic:
+        return np.asarray(agent.policy_mean(t, x, p), dtype=float)
+    u, _, _ = agent.act(t, x, p, deterministic=False)
+    #return np.asarray(u, dtype=float)
+    return np.asarray(agent.policy_mean(t, x, p), dtype=float)
 
 
 def scale_action_to_leverage_cap(u: np.ndarray, wealth: float, leverage_cap: Optional[float]) -> np.ndarray:
@@ -288,10 +308,15 @@ def simulate_method_on_path(
         pk = belief[k]
 
         if (k % step_reb) == 0:
-            if method == "RL":
+            if method == "RLMean":
                 if agent is None:
-                    raise ValueError("RL method requires a loaded agent.")
-                current_u = rl_action(agent, tk, xk, pk)
+                    raise ValueError("RLMean method requires a loaded agent.")
+                current_u = rl_action(agent, tk, xk, pk, deterministic=True)
+                current_u = scale_action_to_leverage_cap(current_u, xk, leverage_cap)
+            elif method == "RLSample":
+                if agent is None:
+                    raise ValueError("RLSample method requires a loaded agent.")
+                current_u = rl_action(agent, tk, xk, pk, deterministic=False)
                 current_u = scale_action_to_leverage_cap(current_u, xk, leverage_cap)
             elif method == "EW":
                 current_u = static_action_from_weights(
@@ -448,7 +473,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--T", type=float, default=10.0)
     ap.add_argument("--dt", type=float, default=1 / 252)
-    ap.add_argument("--z", type=float, default=1.5)
+    ap.add_argument("--z", type=float, default=1.2)
     ap.add_argument("--x0", type=float, default=1.0)
     ap.add_argument("--p0", type=float, default=0.5)
     ap.add_argument("--a_max", type=float, default=2.0)
@@ -464,8 +489,7 @@ def main():
     filt_params = FilterParams(
         mu1=true_params.mu1,
         mu2=true_params.mu2,
-        Sigma1=true_params.Sigma1,
-        Sigma2=true_params.Sigma2,
+        Sigma=true_params.Sigma2,
         lam1=true_params.lam1,
         lam2=true_params.lam2,
         r=true_params.r,
@@ -483,7 +507,7 @@ def main():
     )
 
     leverage_caps: List[Optional[float]] = [None, 2.0, 3.0]
-    methods = ["RL", "EW", "MinVar", "MeanVar"]
+    methods = ["RLMean", "RLSample", "EW", "MinVar", "MeanVar"]
     rebalances = ["daily", "monthly"]
 
     results: List[Dict] = []
@@ -511,7 +535,7 @@ def main():
                         z=args.z,
                         leverage_cap=lev,
                         rebalance_label=reb,
-                        agent=agent if method == "RL" else None,
+                        agent=agent if method in ("RLMean", "RLSample") else None,
                         p0=args.p0,
                         x0=args.x0,
                     )

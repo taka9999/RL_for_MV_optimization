@@ -7,70 +7,85 @@ from .utils import safe_clip_p
 class FilterParams:
     mu1: np.ndarray        # (2,)
     mu2: np.ndarray        # (2,)
-    Sigma1: np.ndarray     # (2,2)
-    Sigma2: np.ndarray     # (2,2)
+    Sigma: np.ndarray      # (2,2), common covariance
     lam1: float
     lam2: float
     r: float = 0.01
 
-def _mvn_logpdf(y: np.ndarray, mean: np.ndarray, cov: np.ndarray) -> float:
-    y = np.asarray(y, dtype=float).reshape(-1)
-    mean = np.asarray(mean, dtype=float).reshape(-1)
-    cov = np.asarray(cov, dtype=float)
-    d = y.shape[0]
-    # stable logpdf
-    cov = cov + 1e-12*np.eye(d)
-    L = np.linalg.cholesky(cov)
-    z = np.linalg.solve(L, (y - mean))
-    log_det = 2.0*np.sum(np.log(np.diag(L)))
-    return -0.5*(d*np.log(2*np.pi) + log_det + np.dot(z, z))
 
 def wonham_filter_q_update(p_prev: float, log_return: np.ndarray, dt: float, fp: FilterParams):
-    """2-asset discrete filter update (Bayes + CTMC transition).
+    """Discretized two-state Wonham/Bayes filter update with common Sigma.
 
+    This version updates two log-unnormalized regime scores separately:
+        q1 = log(alpha1), q2 = log(alpha2),
+        p = alpha1 / (alpha1 + alpha2),
+    rather than updating a single logit q = log(p/(1-p)).
+ 
     We use:
-      p^- = p(1-lam1 dt) + (1-p) lam2 dt
-      y | I=i ~ N(m_i, V_i) with m_i=(mu_i-0.5 diag(Sigma_i))dt, V_i=Sigma_i dt
-      p^+ ∝ p^- * L1, (1-p^-) * L2
-    Returns (p_next, innovation_dummy)
+      1) first-order CTMC prediction on probabilities
+      2) Gaussian observation likelihood under each regime
+      3) normalization in log-space for numerical stability
+
+    Observation model for one step:
+        dlogS ≈ (mu_i - 0.5 diag(Sigma)) dt + L eps,
+        eps ~ N(0, dt I),  Sigma = L L^T.
+
+    Returns
+    -------
+    p_next : float
+        Updated belief P(Y_{t+dt}=1 | F_{t+dt}^S).
+    innovation_scalar : float
+        Scalar diagnostic innovation along the paper-style beta direction.
     """
     p_prev = safe_clip_p(p_prev)
     y = np.asarray(log_return, dtype=float).reshape(2,)
 
-    # predict via CTMC transition (first-order)
+    # CTMC prediction (first-order)
     p_pred = p_prev*(1.0 - fp.lam1*dt) + (1.0 - p_prev)*(fp.lam2*dt)
     p_pred = safe_clip_p(p_pred)
 
     mu1 = np.asarray(fp.mu1, dtype=float).reshape(2,)
     mu2 = np.asarray(fp.mu2, dtype=float).reshape(2,)
-    S1 = np.asarray(fp.Sigma1, dtype=float)
-    S2 = np.asarray(fp.Sigma2, dtype=float)
+    Sigma = np.asarray(fp.Sigma, dtype=float).reshape(2, 2)
+    Sigma = 0.5 * (Sigma + Sigma.T) + 1e-12*np.eye(2)
+    L = np.linalg.cholesky(Sigma)
+    Sigma_inv = np.linalg.inv(Sigma)
 
-    m1 = (mu1 - 0.5*np.diag(S1)) * dt
-    m2 = (mu2 - 0.5*np.diag(S2)) * dt
-    V1 = S1 * dt
-    V2 = S2 * dt
+    #muhat = p_pred * mu1 + (1.0 - p_pred) * mu2
+    #drift_obs = (muhat - 0.5*np.diag(Sigma)) * dt
+    # 2) regime-wise Gaussian observation likelihood for dlogS
+    drift1 = (mu1 - 0.5*np.diag(Sigma)) * dt
+    drift2 = (mu2 - 0.5*np.diag(Sigma)) * dt
 
-    ll1 = _mvn_logpdf(y, m1, V1)
-    ll2 = _mvn_logpdf(y, m2, V2)
-    # posterior
-    a = np.log(p_pred) + ll1
-    b = np.log(1.0 - p_pred) + ll2
-    # log-sum-exp
-    mx = max(a, b)
-    denom = mx + np.log(np.exp(a-mx) + np.exp(b-mx))
-    p_next = np.exp(a - denom)
-    return safe_clip_p(float(p_next)), 0.0
+    err1 = y - drift1
+    err2 = y - drift2
 
-def _logpdf_mvn(y: np.ndarray, mean: np.ndarray, cov: np.ndarray) -> float:
-    """Stable log N(y; mean, cov) for 2D."""
-    y = np.asarray(y, dtype=float).reshape(2,)
-    mean = np.asarray(mean, dtype=float).reshape(2,)
-    cov = np.asarray(cov, dtype=float).reshape(2,2)
-    # add tiny jitter for numerical stability
-    cov = cov + 1e-12*np.eye(2)
-    L = np.linalg.cholesky(cov)
-    z = np.linalg.solve(L, y - mean)
-    quad = float(z.T @ z)
-    logdet = 2.0 * float(np.log(np.diag(L)).sum())
-    return -0.5*(2*np.log(2*np.pi) + logdet + quad)
+    # log-likelihood up to an additive common constant
+    ll1 = -0.5 * float(err1 @ Sigma_inv @ err1) / max(dt, 1e-12)
+    ll2 = -0.5 * float(err2 @ Sigma_inv @ err2) / max(dt, 1e-12)
+
+    # 3) q1, q2 update in log-space
+    q1_next = np.log(p_pred) + ll1
+    q2_next = np.log(1.0 - p_pred) + ll2
+
+    # normalize stably
+    q_max = max(q1_next, q2_next)
+    a1 = np.exp(q1_next - q_max)
+    a2 = np.exp(q2_next - q_max)
+    p_next = a1 / (a1 + a2)
+
+    # diagnostic innovation in the beta direction
+    muhat = p_pred * mu1 + (1.0 - p_pred) * mu2
+    drift_obs = (muhat - 0.5 * np.diag(Sigma)) * dt
+    dBhat = np.linalg.solve(L, (y - drift_obs))
+
+    beta = np.linalg.solve(L, (mu1 - mu2))
+    #beta2 = float(beta @ beta)
+
+    #q_pred = np.log(p_pred) - np.log(1.0 - p_pred)
+    #drift_p = (-(fp.lam1 + fp.lam2) * p_pred + fp.lam2)
+    #drift_q = drift_p / max(p_pred * (1.0 - p_pred), 1e-12) - 0.5 * (1.0 - 2.0 * p_pred) * beta2
+    #q_next = q_pred + drift_q * dt + float(beta @ dBhat)
+
+    #p_next = 1.0 / (1.0 + np.exp(-q_next))
+    return safe_clip_p(float(p_next)), float(beta @ dBhat)
