@@ -74,10 +74,14 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
           critic_steps: int = 5,
           advantage_norm_eps: float = 1e-8,
           omega_ema_beta: float = 0.9,
+          g_p_dep: bool = False,
+          actor_mix_tail: float = 0.5,
+          cov_scale: float = 1.0,
+          lr_step_every: int = 0,
+          lr_gamma: float = 1.0,
           episodes_per_iter: int = 1,
           apply_action_projection: bool = True,
           ):
-
     set_seed(seed)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -110,6 +114,11 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
                         critic_steps=critic_steps,
                         advantage_norm_eps=advantage_norm_eps,
                         omega_ema_beta=omega_ema_beta,
+                        actor_mix_tail=actor_mix_tail,
+                        cov_scale=cov_scale,
+                        g_p_dep=g_p_dep,
+                        lr_step_every=lr_step_every,
+                        lr_gamma=lr_gamma,
                         episodes_per_iter=episodes_per_iter,
                         mu1=policy_params.mu1,
                         mu2=policy_params.mu2,
@@ -171,16 +180,24 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             n = env.n_steps
             t_arr = np.empty(n+1); x_arr = np.empty(n+1); p_arr = np.empty(n+1)
             u_arr = np.empty((n,2))
-
+            f_roll_arr = np.empty(n)
+            dlnf_roll_arr = np.empty(n)
+            #omega_roll_arr = np.empty(n)
+            omega_roll = None
             p = cfg.p0
             t_arr[0]=0.0; x_arr[0]=cfg.x0; p_arr[0]=p
             S_prev = obs["S"]
             u_raw_arr = np.empty((n,2))
 
             for k in range(n):
-                u, u_raw, _ = agent.act(t_arr[k], x_arr[k], p, deterministic=False)
+                u, u_raw, info = agent.act(t_arr[k], x_arr[k], p, deterministic=False)
                 u_raw_arr[k] = np.asarray(u_raw, float)
                 u_arr[k] = np.asarray(u, float)
+                f_roll_arr[k] = info["f_roll"]
+                dlnf_roll_arr[k] = info["dlnf_roll"]
+                #omega_roll_arr[k] = info["omega_roll"]
+                if omega_roll is None:
+                    omega_roll = float(info["omega_roll"])
                 obs, _, done = env.step(u)
                 S_now = obs["S"]
                 log_return = np.log(S_now / S_prev)  # (2,)
@@ -200,13 +217,18 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             p_arr = p_arr[:steps_done+1]
             u_raw_arr = u_raw_arr[:steps_done]
             u_arr = u_arr[:steps_done]
-
-            traj = dict(t=t_arr, x=x_arr, p=p_arr, u=u_arr, u_raw=u_raw_arr, a_max=a_max)
+            f_roll_arr = f_roll_arr[:steps_done]
+            dlnf_roll_arr = dlnf_roll_arr[:steps_done]
+            #omega_roll_arr = omega_roll_arr[:steps_done]
+            traj = dict(t=t_arr, x=x_arr, p=p_arr, u=u_arr, u_raw=u_raw_arr, a_max=a_max,
+                        #f_roll=f_roll_arr,dlnf_roll=dlnf_roll_arr,omega_roll = omega_roll_arr
+                        f_roll=f_roll_arr, dlnf_roll=dlnf_roll_arr, omega_roll=omega_roll)
             batch_trajs.append(traj)
             batch_pos_stats.append(_episode_position_stats(traj))
             batch_xT.append(float(x_arr[-1]))
 
         loss_c, loss_a = agent.update_from_episodes(batch_trajs)
+        agent.step_schedulers()
 
         xT = float(np.mean(batch_xT))
         last_terminals.append(xT)
@@ -220,6 +242,7 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             last_gap = mean_xT - cfg.z
             omega_before = float(agent.omega.detach().cpu())
             agent.update_omega(mean_xT)
+            lr_info = agent.current_lrs()
             omega_after = float(agent.omega.detach().cpu())
             last_domega = omega_after - omega_before
 
@@ -244,6 +267,8 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             max_gross_leverage=mean_pos_stats["max_gross_leverage"],
             min_cash_weight=mean_pos_stats["min_cash_weight"],
             episodes_per_iter=int(episodes_per_iter),
+            lr_theta=agent.current_lrs()["lr_theta"],
+            lr_phi=agent.current_lrs()["lr_phi"],
             **phi
         ))
 
@@ -282,6 +307,11 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             critic_steps=critic_steps,
             advantage_norm_eps=advantage_norm_eps,
             omega_ema_beta=omega_ema_beta,
+            g_p_dep=g_p_dep,
+            actor_mix_tail=actor_mix_tail,
+            cov_scale=cov_scale,
+            lr_step_every=lr_step_every,
+            lr_gamma=lr_gamma,
             policy_params=policy_params.__dict__,
             true_params=true_params.__dict__,
             filter_params=filt_params.__dict__,
@@ -315,6 +345,11 @@ def main():
     ap.add_argument("--critic_steps", type=int, default=20)
     ap.add_argument("--advantage_norm_eps", type=float, default=1e-8)
     ap.add_argument("--omega_ema_beta", type=float, default=0.9)
+    ap.add_argument("--actor_mix_tail", type=float, default=0.5)
+    ap.add_argument("--cov_scale", type=float, default=1.0)
+    ap.add_argument("--g_p_dep", action="store_true")
+    ap.add_argument("--lr_step_every", type=int, default=0)
+    ap.add_argument("--lr_gamma", type=float, default=1.0)
     ap.add_argument("--episodes_per_iter", type=int, default=32)
     ap.add_argument("--z", type=float, default=1.2)
     ap.add_argument("--apply_action_projection", action="store_true")
@@ -325,6 +360,11 @@ def main():
           critic_steps=args.critic_steps,
           advantage_norm_eps=args.advantage_norm_eps,
           omega_ema_beta=args.omega_ema_beta,
+          actor_mix_tail=args.actor_mix_tail,
+          cov_scale=args.cov_scale,
+          g_p_dep=args.g_p_dep,
+          lr_step_every=args.lr_step_every,
+          lr_gamma=args.lr_gamma,
           episodes_per_iter=args.episodes_per_iter,
           cap_mode=args.cap_mode,
           apply_action_projection=args.apply_action_projection,

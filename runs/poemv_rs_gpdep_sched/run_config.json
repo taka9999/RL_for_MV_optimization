@@ -12,12 +12,15 @@
   "z": 1.1,
   "Lambda": 1.0,
   "alpha_theta": 0.0003,
-  "alpha_phi": 0.0003,
+  "alpha_phi": 0.0001,
   "alpha_w": 0.01,
   "omega_update_every": 10,
   "critic_steps": 5,
   "advantage_norm_eps": 1e-08,
   "omega_ema_beta": 0.6,
+  "g_p_dep": true,
+  "lr_step_every": 1000,
+  "lr_gamma": 0.5,
   "policy_params": {
     "mu1": [
       0.25,

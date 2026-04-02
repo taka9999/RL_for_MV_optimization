@@ -6,16 +6,19 @@ class PolyValue(nn.Module):
     """Parametrize ln f(t,p) and g(t,p) with low-order polynomials.
 
     ln f(t,p) = sum_{i=0..m} sum_{j=0..m} theta[i,j] * p^i * (T-t)^j
-    #g(t,p)    = sum_{i=0..mg} sum_{j=1..mg} theta_g[i,j] * p^i * (T-t)^j
-    g(t)      = sum_{j=0..mg} theta_g[j] * (T-t)^j
+    if g_p_dep:
+        g(t,p) = sum_{i=0..mg} sum_{j=0..mg} theta_g[i,j] * p^i * (T-t)^j
+    else:
+        g(t)   = sum_{j=0..mg} theta_g[j] * (T-t)^j
     """
-    def __init__(self, T: float, m: int = 2, mg: int = 2):
+    def __init__(self, T: float, m: int = 2, mg: int = 2, g_p_dep: bool = False):
         super().__init__()
         self.T = float(T)
         self.m = int(m)
         self.mg = int(mg)
+        self.g_p_dep = bool(g_p_dep)
         self.theta = nn.Parameter(torch.zeros((m+1, m+1), dtype=torch.float64))
-        self.theta_g = nn.Parameter(torch.zeros((mg+1,), dtype=torch.float64))
+        self.theta_g = nn.Parameter(torch.zeros((mg+1, mg+1), dtype=torch.float64) if self.g_p_dep else torch.zeros((mg+1,), dtype=torch.float64))
 
     def _tau(self, t: torch.Tensor) -> torch.Tensor:
         return (self.T - t).clamp(min=0.0)
@@ -42,8 +45,13 @@ class PolyValue(nn.Module):
     def g(self, t: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         tau = self._tau(t)
         out = torch.zeros_like(p, dtype=torch.float64)
-        for j in range(self.mg+1):
-            out = out + self.theta_g[j] * (tau**j)
+        if self.g_p_dep:
+            for i in range(self.mg+1):
+                for j in range(self.mg+1):
+                    out = out + self.theta_g[i, j] * (p**i) * (tau**j)
+        else:
+            for j in range(self.mg+1):
+                out = out + self.theta_g[j] * (tau**j)
         return out
 
 class POEMVPolicy(nn.Module):
@@ -70,6 +78,7 @@ class POEMVPolicy(nn.Module):
         dlnf_dp: torch.Tensor,
         f: torch.Tensor,
         Lambda: float,
+        cov_scale: float,
         mu1: torch.Tensor,
         mu2: torch.Tensor,
         Sigma: torch.Tensor,
@@ -98,7 +107,8 @@ class POEMVPolicy(nn.Module):
 
         sigma_inv = torch.cholesky_inverse(chol)
         lam = torch.as_tensor(Lambda, dtype=x.dtype, device=x.device)
-        cov = 0.5 * lam * f.view(-1, 1, 1) * sigma_inv
+        cov_scale_t = torch.as_tensor(cov_scale, dtype=x.dtype, device=x.device)
+        cov = cov_scale_t * 0.5 * lam * f.view(-1, 1, 1) * sigma_inv
         cov = 0.5 * (cov + cov.transpose(-1, -2)) + 1e-10 * eye
 
         return torch.distributions.MultivariateNormal(loc=mean, covariance_matrix=cov)

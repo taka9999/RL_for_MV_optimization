@@ -108,6 +108,7 @@ def build_agent_from_checkpoint(
         omega_update_every=int(run_cfg.get("omega_update_every", 10)),
         critic_steps=int(run_cfg.get("critic_steps", 10)),
         omega_ema_beta=float(run_cfg.get("omega_ema_beta", 0.9)),
+        g_p_dep=bool(run_cfg.get("g_p_dep", False)),
         mu1=cfg_params.mu1,
         mu2=cfg_params.mu2,
         Sigma=cfg_params.Sigma,
@@ -256,8 +257,8 @@ def rl_action(agent: POEMVAgent, t: float, x: float, p: float, deterministic: bo
     if deterministic:
         return np.asarray(agent.policy_mean(t, x, p), dtype=float)
     u, _, _ = agent.act(t, x, p, deterministic=False)
-    #return np.asarray(u, dtype=float)
-    return np.asarray(agent.policy_mean(t, x, p), dtype=float)
+    return np.asarray(u, dtype=float)
+    #return np.asarray(agent.policy_mean(t, x, p), dtype=float)
 
 
 def scale_action_to_leverage_cap(u: np.ndarray, wealth: float, leverage_cap: Optional[float]) -> np.ndarray:
@@ -402,6 +403,88 @@ def summarize_results(results: List[Dict]) -> pd.DataFrame:
         ["rebalance", "leverage_cap", "method"]
     ).reset_index(drop=True)
 
+def save_mean_std_scatter(summary: pd.DataFrame, outdir: Path):
+    for reb in sorted(summary["rebalance"].unique()):
+        sub = summary[summary["rebalance"] == reb].copy()
+        fig = plt.figure(figsize=(8, 6))
+        for _, row in sub.iterrows():
+            plt.scatter(row["std_terminal"], row["mean_terminal"], s=80)
+            plt.text(
+                row["std_terminal"],
+                row["mean_terminal"],
+                f' {row["method"]}',
+                fontsize=9,
+                va="center",
+            )
+        plt.xlabel("std terminal wealth")
+        plt.ylabel("mean terminal wealth")
+        plt.title(f"Mean vs Std terminal wealth | {reb}")
+        fig.tight_layout()
+        fig.savefig(outdir / f"mean_std_scatter_{reb}.png", dpi=200)
+        plt.close(fig)
+
+def save_terminal_boxplot(results: List[Dict], outdir: Path):
+    rows = []
+    for r in results:
+        rows.append(
+            {
+                "method": r["method"],
+                "rebalance": r["rebalance"],
+                "terminal_wealth": float(r["wealth"][-1]),
+            }
+        )
+    df = pd.DataFrame(rows)
+    for reb in sorted(df["rebalance"].unique()):
+        sub = df[df["rebalance"] == reb].copy()
+        methods = list(sub["method"].drop_duplicates())
+        data = [sub.loc[sub["method"] == m, "terminal_wealth"].values for m in methods]
+        fig = plt.figure(figsize=(9, 6))
+        plt.boxplot(data, labels=methods, showfliers=False)
+        plt.ylabel("terminal wealth")
+        plt.title(f"Terminal wealth boxplot | {reb}")
+        fig.tight_layout()
+        fig.savefig(outdir / f"terminal_boxplot_{reb}.png", dpi=200)
+        plt.close(fig)
+
+
+def save_terminal_histograms(results: List[Dict], outdir: Path):
+    rows = []
+    for r in results:
+        rows.append(
+            {
+                "method": r["method"],
+                "rebalance": r["rebalance"],
+                "leverage_cap_label": r["leverage_cap_label"],
+                "terminal_wealth": float(r["wealth"][-1]),
+            }
+        )
+    df = pd.DataFrame(rows)
+    for reb in sorted(df["rebalance"].unique()):
+        for lev in sorted(df["leverage_cap_label"].unique()):
+            sub = df[(df["rebalance"] == reb) & (df["leverage_cap_label"] == lev)].copy()
+            if sub.empty:
+                continue
+            methods = list(sub["method"].drop_duplicates())
+            fig = plt.figure(figsize=(10, 6))
+            for method in methods:
+                x = sub.loc[sub["method"] == method, "terminal_wealth"].values
+                plt.hist(
+                    x,
+                    bins=30,
+                    #histtype="step",
+                    #linewidth=2,
+                    alpha=0.35,
+                    density=False,
+                    label=method,
+                )
+                plt.axvline(float(np.mean(x)), linestyle="--", linewidth=1.5)
+            plt.xlabel("terminal wealth")
+            plt.ylabel("count")
+            plt.title(f"Terminal wealth histogram | {reb} | lev={lev}")
+            plt.legend()
+            fig.tight_layout()
+            fig.savefig(outdir / f"terminal_hist_{reb}_lev_{lev}.png", dpi=200)
+            plt.close(fig)
 
 def save_representative_wealth_plot(
     results: List[Dict],
@@ -430,6 +513,44 @@ def save_representative_wealth_plot(
     fig.savefig(outdir / f"wealth_paths_{rebalance_label}_lev_{leverage_cap_label}.png", dpi=200)
     plt.close(fig)
 
+def save_average_wealth_plot(
+    results: List[Dict],
+    outdir: Path,
+    rebalance_label: str,
+    leverage_cap_label: str,
+):
+    subset = [
+        r for r in results
+        if r["rebalance"] == rebalance_label
+        and r["leverage_cap_label"] == leverage_cap_label
+    ]
+    if not subset:
+        return
+
+    methods = sorted({r["method"] for r in subset})
+    fig = plt.figure(figsize=(11, 6))
+    for method in methods:
+        mats = [r["wealth"] for r in subset if r["method"] == method]
+        t = [r["t"] for r in subset if r["method"] == method][0]
+        mat = np.stack(mats, axis=0)
+        avg_series = np.mean(mat, axis=0)
+        std_series = np.std(mat, axis=0, ddof=0)
+        plt.plot(t, avg_series, label=method)
+        plt.fill_between(
+            t,
+            avg_series - std_series,
+            avg_series + std_series,
+            alpha=0.15,
+            label="_nolegend_",
+        )
+        plt.plot(t, avg_series, label=method)
+    plt.xlabel("time (years)")
+    plt.ylabel("discounted wealth")
+    plt.title(f"Average wealth paths | {rebalance_label} | lev={leverage_cap_label}")
+    plt.legend()
+    fig.tight_layout()
+    fig.savefig(outdir / f"avg_wealth_paths_{rebalance_label}_lev_{leverage_cap_label}.png", dpi=200)
+    plt.close(fig)
 
 def save_average_timeseries_plot(
     results: List[Dict],
@@ -479,6 +600,17 @@ def main():
     ap.add_argument("--a_max", type=float, default=2.0)
     ap.add_argument("--r", type=float, default=0.01)
     ap.add_argument("--device", type=str, default="cpu")
+    ap.add_argument(
+        "--leverage_cap",
+        type=float,
+        default=None,
+        help="Single leverage cap used for all methods. Omit for no ex-post cap.",
+    )
+    ap.add_argument(
+        "--include_rlsample",
+        action="store_true",
+        help="Include stochastic sampled RL policy as a diagnostic method.",
+    )
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
@@ -506,12 +638,16 @@ def main():
         device=args.device,
     )
 
-    leverage_caps: List[Optional[float]] = [None, 2.0, 3.0]
-    methods = ["RLMean", "RLSample", "EW", "MinVar", "MeanVar"]
+    #leverage_caps: List[Optional[float]] = [None, 2.0, 3.0]
+    #methods = ["RLMean", "RLSample", "EW", "MinVar", "MeanVar"]
+    leverage_caps: List[Optional[float]] = [args.leverage_cap]
+    methods = ["RLMean", "EW", "MinVar", "MeanVar"]
+    if args.include_rlsample:
+        methods.insert(1, "RLSample")
     rebalances = ["daily", "monthly"]
 
     results: List[Dict] = []
-    representative_path_ids = list(range(min(4, args.n_paths)))
+    #representative_path_ids = list(range(min(4, args.n_paths)))
 
     for path_id in range(args.n_paths):
         path = generate_test_path(
@@ -523,7 +659,7 @@ def main():
 
         for reb in rebalances:
             for lev in leverage_caps:
-                lev_label = "none" if lev is None else str(int(lev))
+                lev_label = "none" if lev is None else str(float(lev))
                 for method in methods:
                     sim = simulate_method_on_path(
                         method=method,
@@ -552,6 +688,9 @@ def main():
 
     summary = summarize_results(results)
     summary.to_csv(outdir / "eval_summary.csv", index=False)
+    save_mean_std_scatter(summary, outdir)
+    save_terminal_boxplot(results, outdir)
+    save_terminal_histograms(results, outdir)
 
     terminal_rows = []
     for r in results:
@@ -572,7 +711,8 @@ def main():
     for reb in rebalances:
         for lev in leverage_caps:
             lev_label = "none" if lev is None else str(int(lev))
-            save_representative_wealth_plot(results, outdir, reb, lev_label, representative_path_ids)
+            #save_representative_wealth_plot(results, outdir, reb, lev_label, representative_path_ids)
+            save_average_wealth_plot(results, outdir, reb, lev_label)
             save_average_timeseries_plot(
                 results,
                 outdir,
@@ -608,7 +748,8 @@ def main():
                 "r": args.r,
                 "methods": methods,
                 "rebalances": rebalances,
-                "leverage_caps": ["none", 2, 3],
+                "leverage_caps": ["none" if args.leverage_cap is None else float(args.leverage_cap)],
+                "include_rlsample": bool(args.include_rlsample),
             },
             f,
             indent=2,
