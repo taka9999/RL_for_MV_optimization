@@ -113,6 +113,105 @@ def _simulate_center_only(center_agent, path, filt_params, T_years, dt, x0):
         "turnover": turnover,
     }
 
+def _simulate_center_only_with_cost(
+    center_agent,
+    path,
+    filt_params,
+    T_years,
+    dt,
+    x0,
+    tcost,
+    rebalance_every=1,
+):
+    n = path["ret"].shape[0]
+    belief = compute_belief_path(path["logret"], filt_params=filt_params, dt=dt, p0=0.5)
+    wealth = np.empty(n + 1, dtype=float)
+    wealth[0] = x0
+    current_u = np.zeros(2, dtype=float)
+    gross_lev = np.empty(n, dtype=float)
+    cash_w = np.empty(n, dtype=float)
+    turnover = np.empty(n, dtype=float)
+
+    for k in range(n):
+        xk = wealth[k]
+        tk = path["t"][k]
+        pk = belief[k]
+        denom = max(abs(float(xk)), 1e-12)
+
+        if k % rebalance_every == 0:
+            target_u = np.asarray(center_agent.policy_mean(tk, xk, pk), dtype=float)
+            tc = tcost * float(np.sum(np.abs(target_u - current_u)))
+            new_u = target_u
+            turnover[k] = float(np.sum(np.abs(new_u - current_u)) / denom)
+            current_u = new_u
+        else:
+            tc = 0.0
+            turnover[k] = 0.0
+
+        w = current_u / denom
+        gross_lev[k] = float(np.sum(np.abs(w)))
+        cash_w[k] = float(1.0 - np.sum(w))
+
+        disc_ret = np.exp(path["logret"][k] - filt_params.r * dt) - 1.0
+        wealth[k + 1] = xk + float(np.dot(current_u, disc_ret)) - tc
+
+    return {
+        "wealth": wealth,
+        "gross_lev": gross_lev,
+        "cash_w": cash_w,
+        "turnover": turnover,
+    }
+
+
+def _simulate_center_only_fixed_band(
+    center_agent,
+    path,
+    filt_params,
+    T_years,
+    dt,
+    x0,
+    tcost,
+    halfwidth=0.05,
+):
+    n = path["ret"].shape[0]
+    belief = compute_belief_path(path["logret"], filt_params=filt_params, dt=dt, p0=0.5)
+    wealth = np.empty(n + 1, dtype=float)
+    wealth[0] = x0
+    current_u = np.zeros(2, dtype=float)
+    gross_lev = np.empty(n, dtype=float)
+    cash_w = np.empty(n, dtype=float)
+    turnover = np.empty(n, dtype=float)
+
+    for k in range(n):
+        xk = wealth[k]
+        tk = path["t"][k]
+        pk = belief[k]
+        center_u = np.asarray(center_agent.policy_mean(tk, xk, pk), dtype=float)
+        denom = max(abs(float(xk)), 1e-12)
+        center_w = center_u / denom
+        w_cur = current_u / denom
+
+        lower = center_w - halfwidth
+        upper = center_w + halfwidth
+        w_tgt = np.minimum(np.maximum(w_cur, lower), upper)
+        new_u = w_tgt * xk
+        tc = tcost * float(np.sum(np.abs(new_u - current_u)))
+        turnover[k] = float(np.sum(np.abs(new_u - current_u)) / denom)
+        current_u = new_u
+
+        gross_lev[k] = float(np.sum(np.abs(w_tgt)))
+        cash_w[k] = float(1.0 - np.sum(w_tgt))
+
+        disc_ret = np.exp(path["logret"][k] - filt_params.r * dt) - 1.0
+        wealth[k + 1] = xk + float(np.dot(current_u, disc_ret)) - tc
+
+    return {
+        "wealth": wealth,
+        "gross_lev": gross_lev,
+        "cash_w": cash_w,
+        "turnover": turnover,
+    }
+
 def _simulate_dnn_band(center_agent, model, train_cfg, path, filt_params, T_years, dt, x0, tcost):
     n = path["ret"].shape[0]
     belief = compute_belief_path(path["logret"], filt_params=filt_params, dt=dt, p0=0.5)
@@ -228,23 +327,34 @@ def _simulate_direct_boundary(center_agent, model, train_cfg, path, filt_params,
         "turnover": turnover,
     }
 
-def _simulate_static(weights, path, filt_params, dt, x0):
+def _simulate_static(weights, path, filt_params, dt, x0, tcost=0.0, rebalance_every=1):
     n = path["ret"].shape[0]
     wealth = np.empty(n + 1, dtype=float)
     wealth[0] = x0
     gross_lev = np.empty(n, dtype=float)
     cash_w = np.empty(n, dtype=float)
     turnover = np.empty(n, dtype=float)
-    prev_u = np.zeros(2, dtype=float)
+    #prev_u = np.zeros(2, dtype=float)
+    current_u = np.zeros(2, dtype=float)
     for k in range(n):
         xk = wealth[k]
-        u = weights * xk
+        #u = weights * xk
+        denom = max(abs(float(xk)), 1e-12)
+        if k % rebalance_every == 0:
+            new_u = weights * xk
+            tc = tcost * float(np.sum(np.abs(new_u - current_u)))
+            turnover[k] = float(np.sum(np.abs(new_u - current_u)) / denom)
+            current_u = new_u
+        else:
+            tc = 0.0
+            turnover[k] = 0.0
+        u = current_u
         gross_lev[k] = float(np.sum(np.abs(weights)))
         cash_w[k] = float(1.0 - np.sum(weights))
-        turnover[k] = float(np.sum(np.abs(u - prev_u)) / max(abs(float(xk)), 1e-12))
-        prev_u = u.copy()
+        #turnover[k] = float(np.sum(np.abs(u - prev_u)) / max(abs(float(xk)), 1e-12))
+        #prev_u = u.copy()
         disc_ret = np.exp(path["logret"][k] - filt_params.r * dt) - 1.0
-        wealth[k + 1] = xk + float(np.dot(u, disc_ret))
+        wealth[k + 1] = xk + float(np.dot(u, disc_ret)) - tc
     return {
         "wealth": wealth,
         "gross_lev": gross_lev,
@@ -265,6 +375,13 @@ def main():
     ap.add_argument("--z", type=float, default=1.2)
     ap.add_argument("--x0", type=float, default=1.0)
     ap.add_argument("--tcost", type=float, default=0.002)
+    ap.add_argument("--monthly_steps", type=int, default=21)
+    ap.add_argument("--include_center_fixed_band", action="store_true")
+    ap.add_argument("--center_fixed_band_halfwidth", type=float, default=0.05)
+    ap.add_argument("--lev_cap", type=float, default=None)
+    ap.add_argument("--show_wealth_std", dest="show_wealth_std", action="store_true")
+    ap.add_argument("--hide_wealth_std", dest="show_wealth_std", action="store_false")
+    ap.set_defaults(show_wealth_std=True)
     ap.add_argument("--device", type=str, default="cpu")
     args = ap.parse_args()
 
@@ -298,11 +415,20 @@ def main():
     w_gmv = gmv_weights(true_params)
     w_mv = mv_target_weights(true_params, x0=args.x0, z=args.z, T_years=args.T)
 
+    # Align static baselines to the same leverage cap, if requested.
+    if args.lev_cap is not None:
+        w_ew = apply_leverage_cap_to_weights(w_ew, args.lev_cap)
+        w_gmv = apply_leverage_cap_to_weights(w_gmv, args.lev_cap)
+        w_mv = apply_leverage_cap_to_weights(w_mv, args.lev_cap)
+
     rows = []
-    wealth_by_method = {"CenterOnly": [], "DNNBand": [], "EW": [], "MinVar": [], "MeanVar": []}
-    grosslev_by_method = {"CenterOnly": [], "DNNBand": [], "EW": [], "MinVar": [], "MeanVar": []}
-    cash_by_method = {"CenterOnly": [], "DNNBand": [], "EW": [], "MinVar": [], "MeanVar": []}
-    turnover_by_method = {"CenterOnly": [], "DNNBand": [], "EW": [], "MinVar": [], "MeanVar": []}
+    methods = ["CenterOnly_Daily", "CenterOnly_Monthly", "DNNBand", "EW_Monthly", "MinVar_Monthly", "MeanVar_Monthly"]
+    if args.include_center_fixed_band:
+        methods.append("CenterOnly_FixedBand")
+    wealth_by_method = {m: [] for m in methods}
+    grosslev_by_method = {m: [] for m in methods}
+    cash_by_method = {m: [] for m in methods}
+    turnover_by_method = {m: [] for m in methods}
 
     for i in range(args.n_paths):
         path = generate_test_path(
@@ -313,13 +439,33 @@ def main():
         )
 
         sims = {
-            "CenterOnly": _simulate_center_only(center_agent, path, filt_params, args.T, args.dt, args.x0),
-            #"DNNBand": _simulate_dnn_band(center_agent, model, train_cfg, path, filt_params, args.T, args.dt, args.x0, args.tcost),
-            "EW": _simulate_static(w_ew, path, filt_params, args.dt, args.x0),
-            "MinVar": _simulate_static(w_gmv, path, filt_params, args.dt, args.x0),
-            "MeanVar": _simulate_static(w_mv, path, filt_params, args.dt, args.x0),
+            "CenterOnly_Daily": _simulate_center_only_with_cost(
+                center_agent, path, filt_params, args.T, args.dt, args.x0, args.tcost, rebalance_every=1
+            ),
+            "CenterOnly_Monthly": _simulate_center_only_with_cost(
+                center_agent, path, filt_params, args.T, args.dt, args.x0, args.tcost, rebalance_every=args.monthly_steps
+            ),
+            "EW_Monthly": _simulate_static(
+                w_ew, path, filt_params, args.dt, args.x0, tcost=args.tcost, rebalance_every=args.monthly_steps
+            ),
+            "MinVar_Monthly": _simulate_static(
+                w_gmv, path, filt_params, args.dt, args.x0, tcost=args.tcost, rebalance_every=args.monthly_steps
+            ),
+            "MeanVar_Monthly": _simulate_static(
+                w_mv, path, filt_params, args.dt, args.x0, tcost=args.tcost, rebalance_every=args.monthly_steps
+            ),
         }
-
+        if args.include_center_fixed_band:
+            sims["CenterOnly_FixedBand"] = _simulate_center_only_fixed_band(
+                center_agent,
+                path,
+                filt_params,
+                args.T,
+                args.dt,
+                args.x0,
+                args.tcost,
+                halfwidth=args.center_fixed_band_halfwidth,
+            )
         if model_type == "direct_boundary":
             sims["DNNBand"] = _simulate_direct_boundary(
                 center_agent, model, train_cfg, path, filt_params, args.T, args.dt, args.x0, args.tcost
@@ -370,7 +516,8 @@ def main():
         sd = np.std(mat, axis=0, ddof=0)
         t = np.linspace(0.0, args.T, mat.shape[1])
         plt.plot(t, mu, label=method)
-        plt.fill_between(t, mu - sd, mu + sd, alpha=0.15, label="_nolegend_")
+        if args.show_wealth_std:
+            plt.fill_between(t, mu - sd, mu + sd, alpha=0.15, label="_nolegend_")
     plt.xlabel("time (years)")
     plt.ylabel("discounted wealth")
     plt.title("Average wealth path ±1 std")
@@ -453,6 +600,11 @@ def main():
                 "z": args.z,
                 "x0": args.x0,
                 "tcost": args.tcost,
+                "monthly_steps": args.monthly_steps,
+                "include_center_fixed_band": args.include_center_fixed_band,
+                "center_fixed_band_halfwidth": args.center_fixed_band_halfwidth,
+                "lev_cap": args.lev_cap,
+                "show_wealth_std": args.show_wealth_std,
             },
             f,
             indent=2,

@@ -47,10 +47,14 @@ class TrainDirectBoundaryConfig:
     utility_shift: float = 0.0
     lr_step_size: int = 500
     lr_decay: float = 0.5
+    gap_l2_coef: float = 0.0
+    gross_lev_coef: float = 0.0
+    val_every: int = 50
+    val_n_paths: int = 128
+    precompute_center_path: bool = True
     num_workers: int = 0
     device: str = "cpu"
     dtype: torch.dtype = torch.float64
-
 
 def _qvi_base_width(
     center_w: np.ndarray,
@@ -94,7 +98,7 @@ def _make_train_sample(args):
     Returns a dict with:
         path, belief, center_w_path
     """
-    seed_i, T_years, dt, p0, filt_params_dict, stage1_run_dir_str, stage1_ckpt_str, z, device = args
+    seed_i, T_years, dt, p0, filt_params_dict, stage1_run_dir_str, stage1_ckpt_str, z, device, precompute_center_path = args
     true_params = default_true_params()
     filt_params = FilterParams(**filt_params_dict)
     path = generate_test_path(
@@ -109,27 +113,27 @@ def _make_train_sample(args):
         dt=dt,
         p0=p0,
     )
-    center_agent = build_agent_from_checkpoint(
-        ckpt_path=Path(stage1_ckpt_str),
-        run_dir=Path(stage1_run_dir_str),
-        T_years=T_years,
-        dt=dt,
-        a_max=1.0,
-        z=z,
-        r=true_params.r,
-        device=device,
-    )
+    center_w_path = None
+    if precompute_center_path:
+        center_agent = build_agent_from_checkpoint(
+            ckpt_path=Path(stage1_ckpt_str),
+            run_dir=Path(stage1_run_dir_str),
+            T_years=T_years,
+            dt=dt,
+            a_max=1.0,
+            z=z,
+            r=true_params.r,
+            device=device,
+        )
 
-    # Precompute frictionless deterministic center weights at unit wealth.
-    # Assumption: center policy is approximately homogeneous in wealth,
-    # so u(t,x,p) ≈ x * w*(t,p), and w*(t,p) can be obtained from x=1.
-    center_w_path = []
-    for k in range(path["ret"].shape[0]):
-        tk = path["t"][k]
-        pk = belief[k]
-        u_star = np.asarray(center_agent.policy_mean(tk, 1.0, pk), dtype=float)
-        center_w_path.append(u_star.copy())  # at x=1, this is already weight-like
-    center_w_path = np.asarray(center_w_path, dtype=float)
+        # Approximation: u*(t,x,p) ≈ x w*(t,p), so use x=1 path as benchmark center weights.
+        center_w_path = []
+        for k in range(path["ret"].shape[0]):
+            tk = path["t"][k]
+            pk = belief[k]
+            u_star = np.asarray(center_agent.policy_mean(tk, 1.0, pk), dtype=float)
+            center_w_path.append(u_star.copy())
+        center_w_path = np.asarray(center_w_path, dtype=float)
 
     return {"path": path, "belief": belief, "center_w_path": center_w_path}
 
@@ -144,6 +148,7 @@ def _prefetch_train_batch(
     stage1_checkpoint: Path,
     z: float,
     device: str,
+    precompute_center_path: bool,
     num_workers: int,
 ):
     filt_params_dict = {
@@ -165,6 +170,7 @@ def _prefetch_train_batch(
             str(stage1_checkpoint.resolve()),
             z,
             device,
+            precompute_center_path,
         )
         for s in seeds
     ]
@@ -178,11 +184,11 @@ def _prefetch_train_batch(
 
 def simulate_episode_direct_boundary(
     *,
-    #center_agent,
+    center_agent,
     model: DirectBoundaryNet,
     path: Dict[str, np.ndarray],
     belief: np.ndarray,
-    center_w_path: np.ndarray,
+    center_w_path: Optional[np.ndarray],
     filt_params: FilterParams,
     cfg: TrainDirectBoundaryConfig,
 ) -> Dict:
@@ -199,8 +205,9 @@ def simulate_episode_direct_boundary(
 
     lower_gap_all = []
     upper_gap_all = []
-    anchor_pen_all = []
     turnover_all = []
+    gross_lev_all = []
+    gap_l2_all = []
 
     for k in range(n):
         xk_t = wealth_list[-1]
@@ -211,8 +218,18 @@ def simulate_episode_direct_boundary(
         #center_u_t = torch.as_tensor(center_u_np, dtype=model_dtype, device=model_device)
         #denom_t = torch.clamp(torch.abs(xk_t), min=1e-12)
         #center_w_t = center_u_t / denom_t
-        center_w_np = center_w_path[k]
-        center_w_t = torch.as_tensor(center_w_np, dtype=model_dtype, device=model_device)
+        #center_w_np = center_w_path[k]
+        #center_w_t = torch.as_tensor(center_w_np, dtype=model_dtype, device=model_device)
+        if center_w_path is not None:
+            center_w_np = center_w_path[k]
+            center_w_t = torch.as_tensor(center_w_np, dtype=model_dtype, device=model_device)
+        else:
+            xk_float = float(xk_t.detach().cpu())
+            tk = path["t"][k]
+            pk = belief[k]
+            center_u_np = np.asarray(center_agent.policy_mean(tk, xk_float, pk), dtype=float)
+            center_u_t = torch.as_tensor(center_u_np, dtype=model_dtype, device=model_device)
+            center_w_t = center_u_t / torch.clamp(torch.abs(xk_t), min=1e-12)
         w_cur_t = current_u / torch.clamp(torch.abs(xk_t), min=1e-12)
 
         obs_t = torch.stack(
@@ -261,9 +278,11 @@ def simulate_episode_direct_boundary(
         wealth_list.append(x_next_t)
 
         turnover_all.append(torch.sum(torch.abs(new_u_t - w_cur_t * xk_t)) / torch.clamp(torch.abs(xk_t), min=1e-12))
+        gross_lev_all.append(torch.sum(torch.abs(w_tgt_t)))
         lower_gap_all.append(lower_gap_t)
         upper_gap_all.append(upper_gap_t)
         #anchor_pen_all.append(((lower_gap_t - qvi_gap_t) ** 2).mean() + ((upper_gap_t - qvi_gap_t) ** 2).mean())
+        gap_l2_all.append(lower_gap_t.pow(2).mean() + upper_gap_t.pow(2).mean())
 
     xT_t = wealth_list[-1]
     #loss_terminal = (xT_t - torch.as_tensor(cfg.z, dtype=model_dtype, device=model_device)) ** 2
@@ -277,6 +296,8 @@ def simulate_episode_direct_boundary(
     upper_gap_cat = torch.stack(upper_gap_all, dim=0)
     #anchor_pen = torch.stack(anchor_pen_all).mean()
     turnover_pen = torch.stack(turnover_all).mean()
+    gross_lev_pen = torch.stack(gross_lev_all).mean()
+    gap_l2_pen = torch.stack(gap_l2_all).mean()
 
     #loss = (
     #    loss_terminal
@@ -287,6 +308,8 @@ def simulate_episode_direct_boundary(
     loss = (
         -cfg.utility_scale * (utility_t - torch.as_tensor(cfg.utility_shift, dtype=model_dtype, device=model_device))
         + cfg.turnover_coef * turnover_pen
+        + cfg.gap_l2_coef * gap_l2_pen
+        + cfg.gross_lev_coef * gross_lev_pen
     )
 
     return {
@@ -294,10 +317,62 @@ def simulate_episode_direct_boundary(
         "terminal": float(xT_t.detach().cpu()),
         "wealth": torch.stack(wealth_list).detach().cpu().numpy(),
         "avg_turnover": float(turnover_pen.detach().cpu()),
+        "avg_gross_lev": float(gross_lev_pen.detach().cpu()),
+        "gap_l2_pen": float(gap_l2_pen.detach().cpu()),
         "utility": float(utility_t.detach().cpu()),
         "mean_lower_gap": float(lower_gap_cat.mean().detach().cpu()),
         "mean_upper_gap": float(upper_gap_cat.mean().detach().cpu()),
         #"anchor_pen": float(anchor_pen.detach().cpu()),
+    }
+
+def _run_validation(
+    *,
+    center_agent,
+    model: DirectBoundaryNet,
+    stage1_run_dir: Path,
+    stage1_checkpoint: Path,
+    filt_params: FilterParams,
+    cfg: TrainDirectBoundaryConfig,
+    seed: int,
+    n_paths: int,
+):
+    seeds = [seed + 500000 + i for i in range(n_paths)]
+    batch_samples = _prefetch_train_batch(
+        seeds=seeds,
+        T_years=cfg.T_years,
+        dt=cfg.dt,
+        p0=cfg.p0,
+        filt_params=filt_params,
+        stage1_run_dir=stage1_run_dir,
+        stage1_checkpoint=stage1_checkpoint,
+        z=cfg.z,
+        device=cfg.device,
+        precompute_center_path=cfg.precompute_center_path,
+        num_workers=cfg.num_workers,
+    )
+
+    vals = []
+    with torch.no_grad():
+        for sample in batch_samples:
+            vals.append(
+                simulate_episode_direct_boundary(
+                    center_agent=center_agent,
+                    model=model,
+                    path=sample["path"],
+                    belief=sample["belief"],
+                    center_w_path=sample["center_w_path"],
+                    filt_params=filt_params,
+                    cfg=cfg,
+                )
+            )
+
+    return {
+        "val_loss": float(np.mean([v["loss"].detach().cpu().item() if torch.is_tensor(v["loss"]) else float(v["loss"]) for v in vals])),
+        "val_terminal": float(np.mean([v["terminal"] for v in vals])),
+        "val_utility": float(np.mean([v["utility"] for v in vals])),
+        "val_turnover": float(np.mean([v["avg_turnover"] for v in vals])),
+        "val_gross_lev": float(np.mean([v["avg_gross_lev"] for v in vals])),
+        "val_gap_l2": float(np.mean([v["gap_l2_pen"] for v in vals])),
     }
 
 def train_direct_boundary(
@@ -321,16 +396,16 @@ def train_direct_boundary(
         r=true_params.r,
     )
 
-    #center_agent = build_agent_from_checkpoint(
-    #    ckpt_path=stage1_checkpoint,
-    #    run_dir=stage1_run_dir,
-    #    T_years=cfg.T_years,
-    #    dt=cfg.dt,
-    #    a_max=1.0,
-    #    z=cfg.z,
-    #    r=true_params.r,
-    #    device=cfg.device,
-    #)
+    center_agent = build_agent_from_checkpoint(
+        ckpt_path=stage1_checkpoint,
+        run_dir=stage1_run_dir,
+        T_years=cfg.T_years,
+        dt=cfg.dt,
+        a_max=1.0,
+        z=cfg.z,
+        r=true_params.r,
+        device=cfg.device,
+    )
 
     model_cfg = Stage2DNNConfig(obs_dim=9, hidden=cfg.hidden)
     model = DirectBoundaryNet(model_cfg).to(cfg.device, dtype=cfg.dtype)
@@ -343,6 +418,7 @@ def train_direct_boundary(
     )
 
     rows = []
+    best_val_utility = -np.inf
 
     for it in range(1, cfg.iters + 1):
         sims = []
@@ -359,6 +435,7 @@ def train_direct_boundary(
             stage1_checkpoint=stage1_checkpoint,
             z=cfg.z,
             device=cfg.device,
+            precompute_center_path=cfg.precompute_center_path,
             num_workers=cfg.num_workers,
         )
 
@@ -374,7 +451,7 @@ def train_direct_boundary(
             belief = sample["belief"]
             center_w_path = sample["center_w_path"]
             sim = simulate_episode_direct_boundary(
-                #center_agent=center_agent,
+                center_agent=center_agent,
                 model=model,
                 path=path,
                 belief=belief,
@@ -393,17 +470,78 @@ def train_direct_boundary(
         opt.step()
         scheduler.step()
 
+        val_stats = {
+            "val_loss": np.nan,
+            "val_terminal": np.nan,
+            "val_utility": np.nan,
+            "val_turnover": np.nan,
+            "val_gross_lev": np.nan,
+            "val_gap_l2": np.nan,
+        }
+        if cfg.val_every > 0 and (it % cfg.val_every == 0 or it == cfg.iters):
+            val_stats = _run_validation(
+                center_agent=center_agent,
+                model=model,
+                stage1_run_dir=stage1_run_dir,
+                stage1_checkpoint=stage1_checkpoint,
+                filt_params=filt_params,
+                cfg=cfg,
+                seed=seed + 700000 + it,
+                n_paths=cfg.val_n_paths,
+            )
+            if val_stats["val_utility"] > best_val_utility:
+                best_val_utility = val_stats["val_utility"]
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "model_cfg": asdict(model_cfg),
+                        "train_cfg": {
+                            "T_years": cfg.T_years,
+                            "dt": cfg.dt,
+                            "z": cfg.z,
+                            "x0": cfg.x0,
+                            "p0": cfg.p0,
+                            "tcost": cfg.tcost,
+                            "hidden": cfg.hidden,
+                            "lr": cfg.lr,
+                            "weight_decay": cfg.weight_decay,
+                            "iters": cfg.iters,
+                            "episodes_per_iter": cfg.episodes_per_iter,
+                            "gamma_risk": cfg.gamma_risk,
+                            "turnover_coef": cfg.turnover_coef,
+                            "utility_kind": cfg.utility_kind,
+                            "utility_gamma": cfg.utility_gamma,
+                            "utility_scale": cfg.utility_scale,
+                            "utility_shift": cfg.utility_shift,
+                            "lr_step_size": cfg.lr_step_size,
+                            "lr_decay": cfg.lr_decay,
+                            "gap_l2_coef": cfg.gap_l2_coef,
+                            "gross_lev_coef": cfg.gross_lev_coef,
+                            "val_every": cfg.val_every,
+                            "val_n_paths": cfg.val_n_paths,
+                            "precompute_center_path": cfg.precompute_center_path,
+                            "num_workers": cfg.num_workers,
+                            "best_iter": it,
+                            "best_val_utility": best_val_utility,
+                        },
+                    },
+                    outdir / "best_checkpoint.pt",
+                )
+
         row = {
             "iter": it,
             "loss": float(loss.detach().cpu()),
             "mean_terminal": float(np.mean([s["terminal"] for s in sims])),
             "std_terminal": float(np.std([s["terminal"] for s in sims], ddof=0)),
             "avg_turnover": float(np.mean([s["avg_turnover"] for s in sims])),
+            "avg_gross_lev": float(np.mean([s["avg_gross_lev"] for s in sims])),
+            "gap_l2_pen": float(np.mean([s["gap_l2_pen"] for s in sims])),
             "mean_utility": float(np.mean([s["utility"] for s in sims])),
             "mean_lower_gap": float(np.mean([s["mean_lower_gap"] for s in sims])),
             "mean_upper_gap": float(np.mean([s["mean_upper_gap"] for s in sims])),
             #"anchor_pen": float(np.mean([s["anchor_pen"] for s in sims])),
             "lr": float(scheduler.get_last_lr()[0]),
+            **val_stats,
         }
         rows.append(row)
 
@@ -415,6 +553,9 @@ def train_direct_boundary(
 
     fig = plt.figure(figsize=(8, 5))
     plt.plot(df["iter"], df["mean_terminal"], label="mean_terminal")
+    if "val_terminal" in df.columns:
+        m = df["val_terminal"].notna()
+        plt.plot(df.loc[m, "iter"], df.loc[m, "val_terminal"], label="val_terminal")
     plt.axhline(cfg.z, linestyle="--")
     plt.xlabel("iteration")
     plt.ylabel("mean terminal wealth")
@@ -425,7 +566,10 @@ def train_direct_boundary(
     plt.close(fig)
 
     fig = plt.figure(figsize=(8, 5))
-    plt.plot(df["iter"], df["mean_utility"], label="mean_utility")
+    plt.plot(df["iter"], df["mean_utility"], label="train_utility")
+    if "val_utility" in df.columns:
+        m = df["val_utility"].notna()
+        plt.plot(df.loc[m, "iter"], df.loc[m, "val_utility"], label="val_utility")
     plt.xlabel("iteration")
     plt.ylabel("utility")
     plt.title("Stage2 direct-boundary utility")
@@ -435,7 +579,10 @@ def train_direct_boundary(
     plt.close(fig)
 
     fig = plt.figure(figsize=(8, 5))
-    plt.plot(df["iter"], df["loss"], label="loss")
+    plt.plot(df["iter"], df["loss"], label="train_loss")
+    if "val_loss" in df.columns:
+        m = df["val_loss"].notna()
+        plt.plot(df.loc[m, "iter"], df.loc[m, "val_loss"], label="val_loss")
     plt.xlabel("iteration")
     plt.ylabel("objective")
     plt.title("Stage2 direct-boundary objective")
@@ -470,6 +617,11 @@ def train_direct_boundary(
                 "utility_shift": cfg.utility_shift,
                 "lr_step_size": cfg.lr_step_size,
                 "lr_decay": cfg.lr_decay,
+                "gap_l2_coef": cfg.gap_l2_coef,
+                "gross_lev_coef": cfg.gross_lev_coef,
+                "val_every": cfg.val_every,
+                "val_n_paths": cfg.val_n_paths,
+                "precompute_center_path": cfg.precompute_center_path,
                 "num_workers": cfg.num_workers,
             },
         },
@@ -503,6 +655,11 @@ def train_direct_boundary(
                 "utility_shift": cfg.utility_shift,
                 "lr_step_size": cfg.lr_step_size,
                 "lr_decay": cfg.lr_decay,
+                "gap_l2_coef": cfg.gap_l2_coef,
+                "gross_lev_coef": cfg.gross_lev_coef,
+                "val_every": cfg.val_every,
+                "val_n_paths": cfg.val_n_paths,
+                "precompute_center_path": cfg.precompute_center_path, 
             },
             f,
             indent=2,
@@ -536,6 +693,13 @@ def main():
     ap.add_argument("--utility_shift", type=float, default=0.0)
     ap.add_argument("--lr_step_size", type=int, default=500)
     ap.add_argument("--lr_decay", type=float, default=0.5)
+    ap.add_argument("--gap_l2_coef", type=float, default=0.0)
+    ap.add_argument("--gross_lev_coef", type=float, default=0.0)
+    ap.add_argument("--val_every", type=int, default=50)
+    ap.add_argument("--val_n_paths", type=int, default=128)
+    ap.add_argument("--precompute_center_path", dest="precompute_center_path", action="store_true")
+    ap.add_argument("--no_precompute_center_path", dest="precompute_center_path", action="store_false")
+    ap.set_defaults(precompute_center_path=True)
     ap.add_argument("--num_workers", type=int, default=0)
     ap.add_argument("--device", type=str, default="cpu")
     args = ap.parse_args()
@@ -562,6 +726,11 @@ def main():
         utility_shift=args.utility_shift,
         lr_step_size=args.lr_step_size,
         lr_decay=args.lr_decay,
+        gap_l2_coef=args.gap_l2_coef,
+        gross_lev_coef=args.gross_lev_coef,
+        val_every=args.val_every,
+        val_n_paths=args.val_n_paths,
+        precompute_center_path=args.precompute_center_path,
         num_workers=args.num_workers,
         device=args.device,
     )
