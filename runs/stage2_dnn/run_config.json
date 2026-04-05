@@ -1,0 +1,20 @@
+{
+  "stage1_run_dir": "/Users/taka/Library/CloudStorage/GoogleDrive-ktaka8128@gmail.com/My Drive/Princeton/Mulvey/Multiperiod_Opt/poemv_rs/runs/poemv_rs_less_noisy4",
+  "stage1_checkpoint": "/Users/taka/Library/CloudStorage/GoogleDrive-ktaka8128@gmail.com/My Drive/Princeton/Mulvey/Multiperiod_Opt/poemv_rs/runs/poemv_rs_less_noisy4/checkpoint.pt",
+  "seed": 0,
+  "T_years": 1.0,
+  "dt": 0.003968253968253968,
+  "z": 1.2,
+  "x0": 1.0,
+  "p0": 0.5,
+  "tcost": 0.002,
+  "hidden": 64,
+  "lr": 0.001,
+  "weight_decay": 1e-06,
+  "iters": 500,
+  "episodes_per_iter": 16,
+  "gamma_risk": 5.0,
+  "qvi_width_floor": 0.0001,
+  "width_anchor_coef": 0.01,
+  "turnover_coef": 0.0
+}
