@@ -15,6 +15,7 @@ import torch.optim as optim
 
 from .eval_compare import (
     build_agent_from_checkpoint,
+    load_run_config,
     compute_belief_path,
     default_true_params,
     generate_test_path,
@@ -55,6 +56,34 @@ class TrainDirectBoundaryConfig:
     num_workers: int = 0
     device: str = "cpu"
     dtype: torch.dtype = torch.float64
+
+def _params_from_dict(d: Dict, fallback=None):
+    if fallback is None:
+        fallback = default_true_params()
+    src = d or {}
+    return dict(
+        mu1=np.asarray(src.get("mu1", fallback.mu1), dtype=float),
+        mu2=np.asarray(src.get("mu2", fallback.mu2), dtype=float),
+        Sigma=np.asarray(src.get("Sigma", fallback.Sigma), dtype=float),
+        lam1=float(src.get("lam1", fallback.lam1)),
+        lam2=float(src.get("lam2", fallback.lam2)),
+        r=float(src.get("r", fallback.r)),
+    )
+
+def _load_true_and_filter_params(stage1_run_dir: Path, filter_mode: str):
+    run_cfg = load_run_config(stage1_run_dir)
+    fallback = default_true_params()
+
+    true_src = _params_from_dict(run_cfg.get("true_params", {}), fallback=fallback)
+    true_params = default_true_params()
+    true_params.mu1 = true_src["mu1"]; true_params.mu2 = true_src["mu2"]
+    true_params.Sigma = true_src["Sigma"]; true_params.lam1 = true_src["lam1"]
+    true_params.lam2 = true_src["lam2"]; true_params.r = true_src["r"]
+
+    filt_key = "estimated_params" if filter_mode == "estimated_params" else "true_params"
+    filt_src = _params_from_dict(run_cfg.get(filt_key, {}), fallback=true_params)
+    filt_params = FilterParams(**filt_src)
+    return true_params, filt_params
 
 def _qvi_base_width(
     center_w: np.ndarray,
@@ -98,8 +127,16 @@ def _make_train_sample(args):
     Returns a dict with:
         path, belief, center_w_path
     """
-    seed_i, T_years, dt, p0, filt_params_dict, stage1_run_dir_str, stage1_ckpt_str, z, device, precompute_center_path = args
+    #seed_i, T_years, dt, p0, filt_params_dict, stage1_run_dir_str, stage1_ckpt_str, z, device, precompute_center_path = args
+    #true_params = default_true_params()
+    seed_i, T_years, dt, p0, true_params_dict, filt_params_dict, stage1_run_dir_str, stage1_ckpt_str, z, device, precompute_center_path = args
     true_params = default_true_params()
+    true_params.mu1 = np.asarray(true_params_dict["mu1"], dtype=float)
+    true_params.mu2 = np.asarray(true_params_dict["mu2"], dtype=float)
+    true_params.Sigma = np.asarray(true_params_dict["Sigma"], dtype=float)
+    true_params.lam1 = float(true_params_dict["lam1"])
+    true_params.lam2 = float(true_params_dict["lam2"])
+    true_params.r = float(true_params_dict["r"])
     filt_params = FilterParams(**filt_params_dict)
     path = generate_test_path(
         true_params,
@@ -143,6 +180,7 @@ def _prefetch_train_batch(
     T_years: float,
     dt: float,
     p0: float,
+    true_params,
     filt_params: FilterParams,
     stage1_run_dir: Path,
     stage1_checkpoint: Path,
@@ -151,6 +189,14 @@ def _prefetch_train_batch(
     precompute_center_path: bool,
     num_workers: int,
 ):
+    true_params_dict = {
+        "mu1": np.asarray(true_params.mu1, dtype=float),
+        "mu2": np.asarray(true_params.mu2, dtype=float),
+        "Sigma": np.asarray(true_params.Sigma, dtype=float),
+        "lam1": float(true_params.lam1),
+        "lam2": float(true_params.lam2),
+        "r": float(true_params.r),
+    }
     filt_params_dict = {
         "mu1": filt_params.mu1,
         "mu2": filt_params.mu2,
@@ -165,6 +211,7 @@ def _prefetch_train_batch(
             T_years,
             dt,
             p0,
+            true_params_dict,
             filt_params_dict,
             str(stage1_run_dir.resolve()),
             str(stage1_checkpoint.resolve()),
@@ -331,9 +378,11 @@ def _run_validation(
     model: DirectBoundaryNet,
     stage1_run_dir: Path,
     stage1_checkpoint: Path,
+    true_params,
     filt_params: FilterParams,
     cfg: TrainDirectBoundaryConfig,
     seed: int,
+    filter_mode: str,
     n_paths: int,
 ):
     seeds = [seed + 500000 + i for i in range(n_paths)]
@@ -342,6 +391,7 @@ def _run_validation(
         T_years=cfg.T_years,
         dt=cfg.dt,
         p0=cfg.p0,
+        true_params=true_params,
         filt_params=filt_params,
         stage1_run_dir=stage1_run_dir,
         stage1_checkpoint=stage1_checkpoint,
@@ -382,19 +432,21 @@ def train_direct_boundary(
     outdir: Path,
     cfg: TrainDirectBoundaryConfig,
     seed: int,
+    filter_mode: str = "true_params",
 ):
     set_seed(seed)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    true_params = default_true_params()
-    filt_params = FilterParams(
-        mu1=true_params.mu1,
-        mu2=true_params.mu2,
-        Sigma=true_params.Sigma,
-        lam1=true_params.lam1,
-        lam2=true_params.lam2,
-        r=true_params.r,
-    )
+    #true_params = default_true_params()
+    #filt_params = FilterParams(
+    #    mu1=true_params.mu1,
+    #    mu2=true_params.mu2,
+    #    Sigma=true_params.Sigma,
+    #    lam1=true_params.lam1,
+    #    lam2=true_params.lam2,
+    #    r=true_params.r,
+    #)
+    true_params, filt_params = _load_true_and_filter_params(stage1_run_dir, filter_mode)
 
     center_agent = build_agent_from_checkpoint(
         ckpt_path=stage1_checkpoint,
@@ -430,6 +482,7 @@ def train_direct_boundary(
             T_years=cfg.T_years,
             dt=cfg.dt,
             p0=cfg.p0,
+            true_params=true_params,
             filt_params=filt_params,
             stage1_run_dir=stage1_run_dir,
             stage1_checkpoint=stage1_checkpoint,
@@ -484,9 +537,11 @@ def train_direct_boundary(
                 model=model,
                 stage1_run_dir=stage1_run_dir,
                 stage1_checkpoint=stage1_checkpoint,
+                true_params=true_params,
                 filt_params=filt_params,
                 cfg=cfg,
                 seed=seed + 700000 + it,
+                filter_mode=filter_mode,
                 n_paths=cfg.val_n_paths,
             )
             if val_stats["val_utility"] > best_val_utility:
@@ -498,6 +553,7 @@ def train_direct_boundary(
                         "train_cfg": {
                             "T_years": cfg.T_years,
                             "dt": cfg.dt,
+                            "filter_mode": filter_mode,
                             "z": cfg.z,
                             "x0": cfg.x0,
                             "p0": cfg.p0,
@@ -660,6 +716,11 @@ def train_direct_boundary(
                 "val_every": cfg.val_every,
                 "val_n_paths": cfg.val_n_paths,
                 "precompute_center_path": cfg.precompute_center_path, 
+                "filter_mode": filter_mode,
+                "filter_params": {
+                    k: (v.tolist() if isinstance(v, np.ndarray) else v)
+                    for k, v in filt_params.__dict__.items()
+                },
             },
             f,
             indent=2,
@@ -700,6 +761,7 @@ def main():
     ap.add_argument("--precompute_center_path", dest="precompute_center_path", action="store_true")
     ap.add_argument("--no_precompute_center_path", dest="precompute_center_path", action="store_false")
     ap.set_defaults(precompute_center_path=True)
+    ap.add_argument("--filter_mode", type=str, choices=["true_params", "estimated_params"], default="true_params")
     ap.add_argument("--num_workers", type=int, default=0)
     ap.add_argument("--device", type=str, default="cpu")
     args = ap.parse_args()
@@ -741,6 +803,7 @@ def main():
         outdir=Path(args.outdir),
         cfg=cfg,
         seed=args.seed,
+        filter_mode=args.filter_mode,
     )
 
 

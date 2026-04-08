@@ -1,0 +1,53 @@
+{
+  "stage1_run_dir": "/Users/taka/Library/CloudStorage/GoogleDrive-ktaka8128@gmail.com/My Drive/Princeton/Mulvey/Multiperiod_Opt/poemv_rs/runs/poemv_rs_less_noisy4_jm3",
+  "stage1_checkpoint": "/Users/taka/Library/CloudStorage/GoogleDrive-ktaka8128@gmail.com/My Drive/Princeton/Mulvey/Multiperiod_Opt/poemv_rs/runs/poemv_rs_less_noisy4_jm3/checkpoint.pt",
+  "seed": 0,
+  "T_years": 1.0,
+  "dt": 0.003968253968253968,
+  "z": 1.2,
+  "x0": 1.0,
+  "p0": 0.5,
+  "tcost": 0.002,
+  "hidden": 64,
+  "lr": 0.0005,
+  "weight_decay": 1e-06,
+  "iters": 800,
+  "episodes_per_iter": 128,
+  "gamma_risk": 5.0,
+  "turnover_coef": 0.0005,
+  "utility_kind": "log",
+  "utility_gamma": 2.0,
+  "utility_scale": 1.0,
+  "utility_shift": 0.0,
+  "lr_step_size": 100,
+  "lr_decay": 0.5,
+  "gap_l2_coef": 1e-05,
+  "gross_lev_coef": 1e-05,
+  "val_every": 25,
+  "val_n_paths": 64,
+  "precompute_center_path": false,
+  "filter_mode": "estimated_params",
+  "filter_params": {
+    "mu1": [
+      0.38834210144407616,
+      0.21735323517734098
+    ],
+    "mu2": [
+      -0.42988026127683576,
+      -0.3930054537461305
+    ],
+    "Sigma": [
+      [
+        0.04902392039360649,
+        0.011747326094929235
+      ],
+      [
+        0.011747326094929235,
+        0.03225187301503191
+      ]
+    ],
+    "lam1": 0.16409811156935206,
+    "lam2": 1.7499999999999938,
+    "r": 0.01
+  }
+}

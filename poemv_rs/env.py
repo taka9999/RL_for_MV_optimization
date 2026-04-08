@@ -1,13 +1,16 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 
 @dataclass
 class RSGBMParams:
-    mu1: np.ndarray = np.array([0.25, 0.18], dtype=float)
-    mu2: np.ndarray = np.array([-0.73, -0.40], dtype=float)
-    Sigma: np.ndarray = np.array([[0.22**2, 0.22*0.18*0.3],
-                                  [0.22*0.18*0.3, 0.18**2]], dtype=float)
+    mu1: np.ndarray = field(default_factory=lambda: np.array([0.25, 0.18], dtype=float))
+    mu2: np.ndarray = field(default_factory=lambda: np.array([-0.73, -0.40], dtype=float))
+    Sigma: np.ndarray = field(default_factory=lambda: np.array(
+        [[0.22**2, 0.22 * 0.18 * 0.3],
+         [0.22 * 0.18 * 0.3, 0.18**2]],
+        dtype=float,
+    ))
     lam1: float = 0.36   # intensity 1->2
     lam2: float = 2.89   # intensity 2->1
     r: float = 0.01
@@ -43,7 +46,7 @@ class EpisodeConfig:
     T_years: float = 10.0
     dt: float = 1/252
     x0: float = 1.0
-    s0: np.ndarray = np.array([1.0, 1.0], dtype=float)
+    s0: np.ndarray = field(default_factory=lambda: np.array([1.0, 1.0], dtype=float))
     p0: float = 0.5
     a_max: float = 2.0
     omega: float = 0.0

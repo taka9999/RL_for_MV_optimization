@@ -14,6 +14,7 @@ import torch.optim as optim
 
 from .eval_compare import (
     build_agent_from_checkpoint,
+    load_run_config,
     compute_belief_path,
     default_true_params,
     generate_test_path,
@@ -44,6 +45,38 @@ class TrainStage2DNNConfig:
     device: str = "cpu"
     dtype: torch.dtype = torch.float64
 
+
+def _params_from_dict(d: Dict, fallback=None):
+    if fallback is None:
+        fallback = default_true_params()
+    src = d or {}
+    return dict(
+        mu1=np.asarray(src.get("mu1", fallback.mu1), dtype=float),
+        mu2=np.asarray(src.get("mu2", fallback.mu2), dtype=float),
+        Sigma=np.asarray(src.get("Sigma", fallback.Sigma), dtype=float),
+        lam1=float(src.get("lam1", fallback.lam1)),
+        lam2=float(src.get("lam2", fallback.lam2)),
+        r=float(src.get("r", fallback.r)),
+    )
+
+
+def _load_true_and_filter_params(stage1_run_dir: Path, filter_mode: str):
+    run_cfg = load_run_config(stage1_run_dir)
+    fallback = default_true_params()
+
+    true_src = _params_from_dict(run_cfg.get("true_params", {}), fallback=fallback)
+    true_params = default_true_params()
+    true_params.mu1 = true_src["mu1"]
+    true_params.mu2 = true_src["mu2"]
+    true_params.Sigma = true_src["Sigma"]
+    true_params.lam1 = true_src["lam1"]
+    true_params.lam2 = true_src["lam2"]
+    true_params.r = true_src["r"]
+
+    filt_key = "estimated_params" if filter_mode == "estimated_params" else "true_params"
+    filt_src = _params_from_dict(run_cfg.get(filt_key, {}), fallback=true_params)
+    filt_params = FilterParams(**filt_src)
+    return true_params, filt_params
 
 def _obs_vec(
     t: float,
@@ -226,19 +259,12 @@ def train_stage2_dnn(
     outdir: Path,
     cfg: TrainStage2DNNConfig,
     seed: int,
+    filter_mode: str = "true_params",
 ):
     set_seed(seed)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    true_params = default_true_params()
-    filt_params = FilterParams(
-        mu1=true_params.mu1,
-        mu2=true_params.mu2,
-        Sigma=true_params.Sigma,
-        lam1=true_params.lam1,
-        lam2=true_params.lam2,
-        r=true_params.r,
-    )
+    true_params, filt_params = _load_true_and_filter_params(stage1_run_dir, filter_mode)
 
     center_agent = build_agent_from_checkpoint(
         ckpt_path=stage1_checkpoint,
@@ -360,6 +386,23 @@ def train_stage2_dnn(
                     "qvi_width_floor": cfg.qvi_width_floor,
                     "width_anchor_coef": cfg.width_anchor_coef,
                     "turnover_coef": cfg.turnover_coef,
+                    "filter_mode": filter_mode,
+                    "true_params": {
+                        "mu1": np.asarray(true_params.mu1, dtype=float).tolist(),
+                        "mu2": np.asarray(true_params.mu2, dtype=float).tolist(),
+                        "Sigma": np.asarray(true_params.Sigma, dtype=float).tolist(),
+                        "lam1": float(true_params.lam1),
+                        "lam2": float(true_params.lam2),
+                        "r": float(true_params.r),
+                    },
+                    "filter_params": {
+                        "mu1": np.asarray(filt_params.mu1, dtype=float).tolist(),
+                        "mu2": np.asarray(filt_params.mu2, dtype=float).tolist(),
+                        "Sigma": np.asarray(filt_params.Sigma, dtype=float).tolist(),
+                        "lam1": float(filt_params.lam1),
+                        "lam2": float(filt_params.lam2),
+                        "r": float(filt_params.r),
+                    },
                 },
             },
             f,
@@ -389,6 +432,7 @@ def main():
     ap.add_argument("--width_anchor_coef", type=float, default=1e-2)
     ap.add_argument("--turnover_coef", type=float, default=0.0)
     ap.add_argument("--softproj_temp", type=float, default=10.0)
+    ap.add_argument("--filter_mode", type=str, choices=["true_params", "estimated_params"], default="true_params")
     ap.add_argument("--device", type=str, default="cpu")
     args = ap.parse_args()
 
@@ -409,7 +453,7 @@ def main():
         width_anchor_coef=args.width_anchor_coef,
         turnover_coef=args.turnover_coef,
         softproj_temp=args.softproj_temp,
-        device=args.device,
+        device=args.device,        
     )
     train_stage2_dnn(
         stage1_run_dir=Path(args.stage1_run_dir),
@@ -417,6 +461,7 @@ def main():
         outdir=Path(args.outdir),
         cfg=cfg,
         seed=args.seed,
+        filter_mode=args.filter_mode,
     )
 
 

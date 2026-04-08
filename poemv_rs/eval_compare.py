@@ -30,6 +30,18 @@ def default_true_params(r: float = 0.01) -> RSGBMParams:
         r=r,
     )
 
+def _params_from_dict(d: Dict, fallback=None) -> Dict:
+    if fallback is None:
+        fallback = default_true_params()
+    src = d or {}
+    return dict(
+        mu1=np.asarray(src.get("mu1", fallback.mu1), dtype=float),
+        mu2=np.asarray(src.get("mu2", fallback.mu2), dtype=float),
+        Sigma=np.asarray(src.get("Sigma", fallback.Sigma), dtype=float),
+        lam1=float(src.get("lam1", fallback.lam1)),
+        lam2=float(src.get("lam2", fallback.lam2)),
+        r=float(src.get("r", fallback.r)),
+    )
 
 def stationary_bull_prob(params: RSGBMParams) -> float:
     return float(params.lam2 / (params.lam1 + params.lam2))
@@ -72,6 +84,31 @@ def _params_from_run_config(run_cfg: Dict, r: float) -> RSGBMParams:
         lam2=float(src.get("lam2", default_params.lam2)),
         r=float(src.get("r", r)),
     )
+def load_true_and_filter_params(run_dir: Path, filter_mode: str, r: float) -> Tuple[RSGBMParams, FilterParams]:
+    run_cfg = load_run_config(run_dir)
+    fallback = default_true_params(r=r)
+
+    true_src = _params_from_dict(run_cfg.get("true_params", {}), fallback=fallback)
+    true_params = RSGBMParams(
+        mu1=true_src["mu1"],
+        mu2=true_src["mu2"],
+        Sigma=true_src["Sigma"],
+        lam1=true_src["lam1"],
+        lam2=true_src["lam2"],
+        r=true_src["r"],
+    )
+
+    filt_key = "estimated_params" if filter_mode == "estimated_params" else "true_params"
+    filt_src = _params_from_dict(run_cfg.get(filt_key, {}), fallback=true_params)
+    filt_params = FilterParams(
+        mu1=filt_src["mu1"],
+        mu2=filt_src["mu2"],
+        Sigma=filt_src["Sigma"],
+        lam1=filt_src["lam1"],
+        lam2=filt_src["lam2"],
+        r=filt_src["r"],
+    )
+    return true_params, filt_params
 
 def build_agent_from_checkpoint(
     ckpt_path: Path,
@@ -360,6 +397,205 @@ def simulate_method_on_path(
         "path_sharpe_ann": path_sharpe_ann,
     }
 
+def plot_stage2_style_outputs(results: List[Dict], outdir: Path):
+    rows = []
+    methods = sorted({r["method"] for r in results})
+    wealth_by_method = {m: [] for m in methods}
+    gross_by_method = {m: [] for m in methods}
+    cash_by_method = {m: [] for m in methods}
+    turnover_by_method = {m: [] for m in methods}
+
+    for r in results:
+        method = r["method"]
+        wealth_by_method[method].append(r["wealth"])
+        gross_by_method[method].append(r["gross_leverage"])
+        cash_by_method[method].append(r["cash_weight"])
+        if "turnover" in r:
+            turnover_by_method.setdefault(method, []).append(r["turnover"])
+        else:
+            # stage1 compare currently has rebalance-only turnover implicitly;
+            # create a zero placeholder if absent
+            turnover_by_method.setdefault(method, []).append(np.zeros_like(r["gross_leverage"]))
+
+        rows.append(
+            {
+                "method": method,
+                "path_id": r["path_id"],
+                "terminal_wealth": float(r["wealth"][-1]),
+                "gross_lev": float(np.mean(r["gross_leverage"])),
+                "cash_w": float(np.mean(r["cash_weight"])),
+                "turnover": float(np.mean(turnover_by_method[method][-1])),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    summary = (
+        df.groupby("method", as_index=False)
+        .agg(
+            mean_terminal=("terminal_wealth", "mean"),
+            std_terminal=("terminal_wealth", "std"),
+            median_terminal=("terminal_wealth", "median"),
+            mean_gross_lev=("gross_lev", "mean"),
+            mean_cash_w=("cash_w", "mean"),
+            mean_turnover=("turnover", "mean"),
+        )
+    )
+    summary.to_csv(outdir / "eval_summary_stage2style.csv", index=False)
+    df.to_csv(outdir / "eval_terminal_by_path_stage2style.csv", index=False)
+
+    fig = plt.figure(figsize=(8, 6))
+    for method, mats in wealth_by_method.items():
+        mat = np.stack(mats, axis=0)
+        mu = np.mean(mat, axis=0)
+        sd = np.std(mat, axis=0, ddof=0)
+        t = np.linspace(0.0, 1.0, mat.shape[1])
+        plt.plot(t, mu, label=method)
+        plt.fill_between(t, mu - sd, mu + sd, alpha=0.15, label="_nolegend_")
+    plt.xlabel("time (years)")
+    plt.ylabel("discounted wealth")
+    plt.title("Average wealth path ±1 std")
+    plt.legend()
+    fig.tight_layout()
+    fig.savefig(outdir / "avg_wealth.png", dpi=200)
+    plt.close(fig)
+
+    fig = plt.figure(figsize=(8, 6))
+    for method, mats in gross_by_method.items():
+        mat = np.stack(mats, axis=0)
+        mu = np.mean(mat, axis=0)
+        plt.plot(np.linspace(0.0, 1.0, mat.shape[1]), mu, label=method)
+    plt.xlabel("time (years)")
+    plt.ylabel("gross leverage")
+    plt.title("Average gross leverage")
+    plt.legend()
+    fig.tight_layout()
+    fig.savefig(outdir / "avg_gross_lev.png", dpi=200)
+    plt.close(fig)
+
+    fig = plt.figure(figsize=(8, 6))
+    for method, mats in cash_by_method.items():
+        mat = np.stack(mats, axis=0)
+        mu = np.mean(mat, axis=0)
+        plt.plot(np.linspace(0.0, 1.0, mat.shape[1]), mu, label=method)
+    plt.xlabel("time (years)")
+    plt.ylabel("cash weight")
+    plt.title("Average cash weight")
+    plt.legend()
+    fig.tight_layout()
+    fig.savefig(outdir / "avg_cash_weight.png", dpi=200)
+    plt.close(fig)
+
+    fig = plt.figure(figsize=(8, 6))
+    for method, mats in turnover_by_method.items():
+        mat = np.stack(mats, axis=0)
+        mu = np.mean(mat, axis=0)
+        plt.plot(np.linspace(0.0, 1.0, mat.shape[1]), mu, label=method)
+    plt.xlabel("time (years)")
+    plt.ylabel("turnover")
+    plt.title("Average turnover")
+    plt.legend()
+    fig.tight_layout()
+    fig.savefig(outdir / "avg_turnover.png", dpi=200)
+    plt.close(fig)
+
+    fig = plt.figure(figsize=(8, 6))
+    for method, grp in df.groupby("method"):
+        x = grp["terminal_wealth"].to_numpy()
+        n, bins, patches = plt.hist(x, bins=30, alpha=0.35, label="_nolegend_")
+        color = patches[0].get_facecolor() if len(patches) > 0 else "C0"
+        mean_x = float(np.mean(x))
+        plt.axvline(mean_x, linestyle="--", linewidth=1.5, color=color, label=f"{method} mean={mean_x:.3f}")
+    plt.xlabel("terminal wealth")
+    plt.ylabel("count")
+    plt.title("Terminal wealth histogram")
+    plt.legend()
+    fig.tight_layout()
+    fig.savefig(outdir / "terminal_hist.png", dpi=200)
+    plt.close(fig)
+
+def save_center_policy_path_diagnostic(
+    agent: POEMVAgent,
+    path: Dict[str, np.ndarray],
+    filt_params: FilterParams,
+    outdir: Path,
+    p0: float = 0.5,
+    x0: float = 1.0,
+):
+    belief = compute_belief_path(path["logret"], filt_params=filt_params, dt=path["t"][1] - path["t"][0], p0=p0)
+    n = path["ret"].shape[0]
+    wealth = np.empty(n + 1, dtype=float)
+    wealth[0] = x0
+    u_hist = np.empty((n, 2), dtype=float)
+    w_hist = np.empty((n, 2), dtype=float)
+
+    for k in range(n):
+        tk = path["t"][k]
+        xk = wealth[k]
+        pk = belief[k]
+        u = np.asarray(agent.policy_mean(tk, xk, pk), dtype=float)
+        denom = max(abs(float(xk)), 1e-12)
+        w = u / denom
+        u_hist[k] = u
+        w_hist[k] = w
+        wealth[k + 1] = xk + float(np.dot(u, path["ret"][k]))
+
+    t = path["t"][:-1]
+
+    for j in range(2):
+        fig = plt.figure(figsize=(10, 5))
+        plt.plot(t, u_hist[:, j], label=f"raw u[{j}]")
+        plt.plot(t, w_hist[:, j], label=f"normalized weight[{j}]")
+        plt.plot(t, belief[:-1], linestyle=":", label="belief p_t")
+        plt.xlabel("time (years)")
+        plt.ylabel(f"asset {j+1}")
+        plt.title(f"Center policy path diagnostic | asset {j+1}")
+        plt.legend()
+        fig.tight_layout()
+        fig.savefig(outdir / f"center_policy_path_asset{j+1}.png", dpi=200)
+        plt.close(fig)
+
+def save_center_policy_fixed_belief_grid(
+    agent: POEMVAgent,
+    outdir: Path,
+    T_years: float,
+    x0: float = 1.0,
+    beliefs: Optional[List[float]] = None,
+):
+    if beliefs is None:
+        beliefs = [0.05, 0.25, 0.50, 0.75, 0.95]
+    t_grid = np.linspace(0.0, T_years, 200)
+
+    raw_by_p = {p: np.empty((len(t_grid), 2), dtype=float) for p in beliefs}
+    w_by_p = {p: np.empty((len(t_grid), 2), dtype=float) for p in beliefs}
+
+    for i, t in enumerate(t_grid):
+        for p in beliefs:
+            u = np.asarray(agent.policy_mean(float(t), float(x0), float(p)), dtype=float)
+            raw_by_p[p][i] = u
+            w_by_p[p][i] = u / max(abs(float(x0)), 1e-12)
+
+    for j in range(2):
+        fig = plt.figure(figsize=(10, 5))
+        for p in beliefs:
+            plt.plot(t_grid, raw_by_p[p][:, j], label=f"raw u[{j}] | p={p:.2f}")
+        plt.xlabel("time (years)")
+        plt.ylabel(f"raw output asset {j+1}")
+        plt.title(f"Center policy raw output on fixed belief grid | asset {j+1}")
+        plt.legend(ncol=2)
+        fig.tight_layout()
+        fig.savefig(outdir / f"center_policy_raw_grid_asset{j+1}.png", dpi=200)
+        plt.close(fig)
+
+        fig = plt.figure(figsize=(10, 5))
+        for p in beliefs:
+            plt.plot(t_grid, w_by_p[p][:, j], label=f"w[{j}] | p={p:.2f}")
+        plt.xlabel("time (years)")
+        plt.ylabel(f"normalized weight asset {j+1}")
+        plt.title(f"Center policy normalized weight on fixed belief grid | asset {j+1}")
+        plt.legend(ncol=2)
+        fig.tight_layout()
+        fig.savefig(outdir / f"center_policy_weight_grid_asset{j+1}.png", dpi=200)
+        plt.close(fig)
 
 def summarize_results(results: List[Dict]) -> pd.DataFrame:
     rows = []
@@ -536,13 +772,7 @@ def save_average_wealth_plot(
         avg_series = np.mean(mat, axis=0)
         std_series = np.std(mat, axis=0, ddof=0)
         plt.plot(t, avg_series, label=method)
-        plt.fill_between(
-            t,
-            avg_series - std_series,
-            avg_series + std_series,
-            alpha=0.15,
-            label="_nolegend_",
-        )
+        #plt.fill_between(t,avg_series - std_series,avg_series + std_series,alpha=0.15,label="_nolegend_",)
         plt.plot(t, avg_series, label=method)
     plt.xlabel("time (years)")
     plt.ylabel("discounted wealth")
@@ -584,6 +814,72 @@ def save_average_timeseries_plot(
     fig.savefig(outdir / f"{filename_stub}_{rebalance_label}_lev_{leverage_cap_label}.png", dpi=200)
     plt.close(fig)
 
+def save_stage1_diagnostic_panel(
+    agent: POEMVAgent,
+    path: Dict[str, np.ndarray],
+    filt_params: FilterParams,
+    outdir: Path,
+    x0: float = 1.0,
+    p0: float = 0.5,
+):
+    """
+    Stage2-style diagnostic for Stage1 center policy:
+      - true regime shading
+      - belief p_t
+      - raw action u_t
+      - normalized weight u_t / x_t
+    One figure per asset.
+    """
+    n = path["ret"].shape[0]
+    dt = float(path["t"][1] - path["t"][0])
+    belief = compute_belief_path(path["logret"], filt_params=filt_params, dt=dt, p0=p0)
+    belief = belief[:n]
+    regime_true = np.asarray(path["I"][:n], dtype=int)
+    t = np.asarray(path["t"][:n], dtype=float)
+
+    wealth = np.empty(n + 1, dtype=float)
+    wealth[0] = x0
+    u_hist = np.empty((n, 2), dtype=float)
+    w_hist = np.empty((n, 2), dtype=float)
+
+    for k in range(n):
+        tk = t[k]
+        xk = wealth[k]
+        pk = belief[k]
+        u = np.asarray(agent.policy_mean(tk, xk, pk), dtype=float)
+        w = u / max(abs(float(xk)), 1e-12)
+        u_hist[k] = u
+        w_hist[k] = w
+        wealth[k + 1] = xk + float(np.dot(u, path["ret"][k]))
+
+    for j in range(2):
+        fig, ax1 = plt.subplots(figsize=(11, 5))
+
+        start = 0
+        for k in range(1, n + 1):
+            if k == n or regime_true[k] != regime_true[start]:
+                color = "green" if regime_true[start] == 1 else "red"
+                ax1.axvspan(t[start], t[k - 1], alpha=0.08, color=color)
+                start = k
+
+        ax1.plot(t, u_hist[:, j], label=f"raw_u[{j}]", linewidth=1.8)
+        ax1.plot(t, w_hist[:, j], label=f"weight[{j}]", linewidth=1.8)
+        ax1.set_xlabel("time (years)")
+        ax1.set_ylabel(f"asset {j+1}: raw u / weight")
+
+        ax2 = ax1.twinx()
+        ax2.plot(t, belief, linestyle=":", linewidth=1.8, label="belief p_t")
+        ax2.set_ylabel("belief / regime")
+        ax2.set_ylim(-0.05, 1.05)
+
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+        ax1.set_title(f"stage1_diagnostic: asset {j+1}")
+
+        fig.tight_layout()
+        fig.savefig(outdir / f"stage1_diagnostic_asset{j+1}.png", dpi=200)
+        plt.close(fig)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -599,6 +895,10 @@ def main():
     ap.add_argument("--p0", type=float, default=0.5)
     ap.add_argument("--a_max", type=float, default=2.0)
     ap.add_argument("--r", type=float, default=0.01)
+    ap.add_argument("--filter_mode", type=str, choices=["true_params", "estimated_params"], default="true_params")
+    ap.add_argument("--plot_center_policy_diagnostics", action="store_true")
+    ap.add_argument("--plot_stage1_diagnostic", action="store_true")
+    ap.add_argument("--diagnostic_path_id", type=int, default=0)
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument(
         "--leverage_cap",
@@ -617,14 +917,19 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     set_seed(args.seed)
 
-    true_params = default_true_params(r=args.r)
-    filt_params = FilterParams(
-        mu1=true_params.mu1,
-        mu2=true_params.mu2,
-        Sigma=true_params.Sigma2,
-        lam1=true_params.lam1,
-        lam2=true_params.lam2,
-        r=true_params.r,
+    #true_params = default_true_params(r=args.r)
+    #filt_params = FilterParams(
+    #    mu1=true_params.mu1,
+    #    mu2=true_params.mu2,
+    #    Sigma=true_params.Sigma2,
+    #    lam1=true_params.lam1,
+    #    lam2=true_params.lam2,
+    #    r=true_params.r,
+    #)
+    true_params, filt_params = load_true_and_filter_params(
+        run_dir=Path(args.run_dir),
+        filter_mode=args.filter_mode,
+        r=args.r,
     )
 
     agent = build_agent_from_checkpoint(
@@ -692,6 +997,28 @@ def main():
     save_terminal_boxplot(results, outdir)
     save_terminal_histograms(results, outdir)
 
+    if args.plot_center_policy_diagnostics:
+        diag_path = generate_test_path(
+            true_params,
+            T_years=args.T,
+            dt=args.dt,
+            seed=args.seed + 10_000 + args.diagnostic_path_id,
+        )
+        save_center_policy_path_diagnostic(
+            agent=agent,
+            path=diag_path,
+            filt_params=filt_params,
+            outdir=outdir,
+            p0=args.p0,
+            x0=args.x0,
+        )
+        save_center_policy_fixed_belief_grid(
+            agent=agent,
+            outdir=outdir,
+            T_years=args.T,
+            x0=args.x0,
+        )
+
     terminal_rows = []
     for r in results:
         terminal_rows.append(
@@ -731,7 +1058,22 @@ def main():
                 ylabel="cash weight",
                 filename_stub="avg_cash_weight",
             )
-
+    plot_stage2_style_outputs(results, outdir)
+    if args.plot_stage1_diagnostic:
+        diag_path = generate_test_path(
+            true_params,
+            T_years=args.T,
+            dt=args.dt,
+            seed=args.seed + 10_000 + args.diagnostic_path_id,
+        )
+        save_stage1_diagnostic_panel(
+            agent=agent,
+            path=diag_path,
+            filt_params=filt_params,
+            outdir=outdir,
+            x0=args.x0,
+            p0=args.p0,
+        )
     with open(outdir / "eval_config.json", "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -750,6 +1092,9 @@ def main():
                 "rebalances": rebalances,
                 "leverage_caps": ["none" if args.leverage_cap is None else float(args.leverage_cap)],
                 "include_rlsample": bool(args.include_rlsample),
+                "filter_mode": args.filter_mode,
+                "plot_center_policy_diagnostics": bool(args.plot_center_policy_diagnostics),
+                "diagnostic_path_id": args.diagnostic_path_id,
             },
             f,
             indent=2,

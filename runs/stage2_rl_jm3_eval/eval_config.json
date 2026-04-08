@@ -1,0 +1,19 @@
+{
+  "stage1_run_dir": "/Users/taka/Library/CloudStorage/GoogleDrive-ktaka8128@gmail.com/My Drive/Princeton/Mulvey/Multiperiod_Opt/poemv_rs/runs/poemv_rs_less_noisy4_jm3",
+  "stage1_checkpoint": "/Users/taka/Library/CloudStorage/GoogleDrive-ktaka8128@gmail.com/My Drive/Princeton/Mulvey/Multiperiod_Opt/poemv_rs/runs/poemv_rs_less_noisy4_jm3/checkpoint.pt",
+  "stage2_checkpoint": "/Users/taka/Library/CloudStorage/GoogleDrive-ktaka8128@gmail.com/My Drive/Princeton/Mulvey/Multiperiod_Opt/poemv_rs/runs/stage2_rl_jm3/best_checkpoint.pt",
+  "stage2_model_type": "stage2_rl",
+  "n_paths": 500,
+  "seed": 0,
+  "T": 1.0,
+  "dt": 0.003968253968253968,
+  "z": 1.2,
+  "x0": 1.0,
+  "tcost": 0.002,
+  "monthly_steps": 21,
+  "include_center_fixed_band": true,
+  "center_fixed_band_halfwidth": 0.05,
+  "filter_mode": "estimated_params",
+  "lev_cap": 1.5,
+  "show_wealth_std": false
+}
