@@ -1,0 +1,175 @@
+{
+  "outdir": "runs/stage1_regime_cov_jm_like_commoncfg_sigmas_long_bs64_rev",
+  "seed": 0,
+  "iters": 16000,
+  "episodes_per_iter": 32,
+  "val_every": 100,
+  "val_n_paths": 64,
+  "T": 1.0,
+  "dt": 0.003968253968253968,
+  "x0": 1.0,
+  "p0": 0.5,
+  "z": 1.2,
+  "Lambda": 1.0,
+  "r": 0.01,
+  "a_max": 1.0,
+  "cap_mode": "component_tanh",
+  "sigma_mode": "regime",
+  "cov_mode": "belief_avg_regime",
+  "mu1_json": null,
+  "mu2_json": null,
+  "sigma1_json": null,
+  "sigma2_json": null,
+  "lam1": 0.36,
+  "lam2": 2.89,
+  "m_poly": 2,
+  "mg_poly": 2,
+  "g_p_dep": true,
+  "actor_mix_tail": 0.3,
+  "cov_scale": 0.1,
+  "alpha_w": 0.01,
+  "alpha_theta": 0.0003,
+  "alpha_phi": 0.0001,
+  "omega_init": 0.0,
+  "omega_update_every": 10,
+  "critic_steps": 1,
+  "omega_ema_beta": 0.5,
+  "grad_clip": 1.0,
+  "lr_step_every": 2000,
+  "lr_gamma": 0.5,
+  "device": "cpu",
+  "estimation_method": "jump_model",
+  "estimation_T": 20.0,
+  "estimation_seed": null,
+  "index_mode": "equal_weight",
+  "Y_l": 0.19,
+  "Y_u": 0.24,
+  "jm_params_json": null,
+  "jm_regimes_csv": null,
+  "jump_penalty": 100.0,
+  "jm_max_iter": 400,
+  "jm_n_init": 10,
+  "belief_mode": "estimated_params",
+  "est_mu1_json": "[0.2776539939795368, 0.2041085210277895]",
+  "est_mu2_json": "[-0.6257473713314299, -0.2779296812539142]",
+  "est_sigma1_json": "[[0.05084812118509104, 0.012915413493498845], [0.012915413493498845, 0.03372355109898936]]",
+  "est_sigma2_json": "[[0.08501690860376841, 0.036101288685151556], [0.036101288685151556, 0.05102001260443528]]",
+  "est_lam1": 0.23480083857442136,
+  "est_lam2": 1.3512064343163548,
+  "est_r": 0.01,
+  "true_params": {
+    "mu1": [
+      0.25,
+      0.18
+    ],
+    "mu2": [
+      -0.73,
+      -0.4
+    ],
+    "Sigma1": [
+      [
+        0.0484,
+        0.011879999999999998
+      ],
+      [
+        0.011879999999999998,
+        0.0324
+      ]
+    ],
+    "Sigma2": [
+      [
+        0.09,
+        0.0396
+      ],
+      [
+        0.0396,
+        0.0576
+      ]
+    ],
+    "lam1": 0.36,
+    "lam2": 2.89,
+    "r": 0.01
+  },
+  "estimated_params": {
+    "mu1": [
+      0.2776539939795368,
+      0.2041085210277895
+    ],
+    "mu2": [
+      -0.6257473713314299,
+      -0.2779296812539142
+    ],
+    "Sigma1": [
+      [
+        0.05084812118509104,
+        0.012915413493498845
+      ],
+      [
+        0.012915413493498845,
+        0.03372355109898936
+      ]
+    ],
+    "Sigma2": [
+      [
+        0.08501690860376841,
+        0.036101288685151556
+      ],
+      [
+        0.036101288685151556,
+        0.05102001260443528
+      ]
+    ],
+    "lam1": 0.23480083857442136,
+    "lam2": 1.3512064343163548,
+    "r": 0.01
+  },
+  "filter_params": {
+    "mu1": [
+      0.2776539939795368,
+      0.2041085210277895
+    ],
+    "mu2": [
+      -0.6257473713314299,
+      -0.2779296812539142
+    ],
+    "Sigma1": [
+      [
+        0.05084812118509104,
+        0.012915413493498845
+      ],
+      [
+        0.012915413493498845,
+        0.03372355109898936
+      ]
+    ],
+    "Sigma2": [
+      [
+        0.08501690860376841,
+        0.036101288685151556
+      ],
+      [
+        0.036101288685151556,
+        0.05102001260443528
+      ]
+    ],
+    "lam1": 0.23480083857442136,
+    "lam2": 1.3512064343163548,
+    "r": 0.01
+  },
+  "training_modes": {
+    "sigma_mode": "regime",
+    "cov_mode": "belief_avg_regime",
+    "belief_mode": "estimated_params"
+  },
+  "estimation": {
+    "estimation_method": "jump_model",
+    "jump_penalty": 100.0,
+    "jm_max_iter": 400,
+    "jm_n_init": 10,
+    "jm_params_json": null,
+    "jm_regimes_csv": null,
+    "index_mode": "equal_weight",
+    "Y_l": 0.19,
+    "Y_u": 0.24
+  }
+}

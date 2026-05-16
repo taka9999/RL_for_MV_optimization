@@ -39,7 +39,9 @@ class TrainDirectBoundaryConfig:
     iters: int = 2000
     episodes_per_iter: int = 32
     gamma_risk: float = 5.0
-    #qvi_width_floor: float = 1e-4
+    gap_mode: str = "direct"   # direct | qvi_exp
+    qvi_width_floor: float = 1e-4
+    correction_clip: float = 2.0
     #boundary_anchor_coef: float = 1e-2
     turnover_coef: float = 0.0
     utility_kind: str = "log"      # log | sqrt | power
@@ -295,19 +297,33 @@ def simulate_episode_direct_boundary(
             ]
         ).unsqueeze(0)
 
-        lower_gap_t, upper_gap_t = model(obs_t)
-        lower_gap_t = lower_gap_t.squeeze(0)
-        upper_gap_t = upper_gap_t.squeeze(0)
+        #lower_gap_t, upper_gap_t = model(obs_t)
+        #lower_gap_t = lower_gap_t.squeeze(0)
+        #upper_gap_t = upper_gap_t.squeeze(0)
 
-        # QVI prior only as anchor, not as projection rule
-        #qvi_gap_np = _qvi_base_width(
-        #    center_w=center_u_np / max(abs(xk_float), 1e-12),
-        #    Sigma=filt_params.Sigma,
-        #    kappa=cfg.tcost,
-        #    gamma_risk=cfg.gamma_risk,
-        #    width_floor=cfg.qvi_width_floor,
-        #)
-        #qvi_gap_t = torch.as_tensor(qvi_gap_np, dtype=model_dtype, device=model_device)
+        lower_gap_raw_t, upper_gap_raw_t = model(obs_t)
+        lower_gap_raw_t = lower_gap_raw_t.squeeze(0)
+        upper_gap_raw_t = upper_gap_raw_t.squeeze(0)
+
+        if cfg.gap_mode == "direct":
+            lower_gap_t = lower_gap_raw_t
+            upper_gap_t = upper_gap_raw_t
+        elif cfg.gap_mode == "qvi_exp":
+            qvi_gap_np = _qvi_base_width(
+                center_w=center_w_t.detach().cpu().numpy(),
+                Sigma=filt_params.Sigma,
+                kappa=cfg.tcost,
+                gamma_risk=cfg.gamma_risk,
+                width_floor=cfg.qvi_width_floor,
+            )
+            qvi_gap_t = torch.as_tensor(qvi_gap_np, dtype=model_dtype, device=model_device)
+            clip_c = float(cfg.correction_clip)
+            lower_corr_t = torch.clamp(lower_gap_raw_t, min=-clip_c, max=clip_c)
+            upper_corr_t = torch.clamp(upper_gap_raw_t, min=-clip_c, max=clip_c)
+            lower_gap_t = qvi_gap_t * torch.exp(lower_corr_t)
+            upper_gap_t = qvi_gap_t * torch.exp(upper_corr_t)
+        else:
+            raise ValueError(f"Unknown gap_mode: {cfg.gap_mode}")
 
         lower_t = center_w_t - lower_gap_t
         upper_t = center_w_t + upper_gap_t
@@ -564,6 +580,9 @@ def train_direct_boundary(
                             "iters": cfg.iters,
                             "episodes_per_iter": cfg.episodes_per_iter,
                             "gamma_risk": cfg.gamma_risk,
+                            "gap_mode": cfg.gap_mode,
+                            "qvi_width_floor": cfg.qvi_width_floor,
+                            "correction_clip": cfg.correction_clip,
                             "turnover_coef": cfg.turnover_coef,
                             "utility_kind": cfg.utility_kind,
                             "utility_gamma": cfg.utility_gamma,
@@ -664,7 +683,9 @@ def train_direct_boundary(
                 "iters": cfg.iters,
                 "episodes_per_iter": cfg.episodes_per_iter,
                 "gamma_risk": cfg.gamma_risk,
-                #"qvi_width_floor": cfg.qvi_width_floor,
+                "gap_mode": cfg.gap_mode,
+                "qvi_width_floor": cfg.qvi_width_floor,
+                "correction_clip": cfg.correction_clip,
                 #"boundary_anchor_coef": cfg.boundary_anchor_coef,
                 "turnover_coef": cfg.turnover_coef,
                 "utility_kind": cfg.utility_kind,
@@ -702,7 +723,9 @@ def train_direct_boundary(
                 "iters": cfg.iters,
                 "episodes_per_iter": cfg.episodes_per_iter,
                 "gamma_risk": cfg.gamma_risk,
-                #"qvi_width_floor": cfg.qvi_width_floor,
+                "gap_mode": cfg.gap_mode,
+                "qvi_width_floor": cfg.qvi_width_floor,
+                "correction_clip": cfg.correction_clip,
                 #"boundary_anchor_coef": cfg.boundary_anchor_coef,
                 "turnover_coef": cfg.turnover_coef,
                 "utility_kind": cfg.utility_kind,
@@ -716,6 +739,14 @@ def train_direct_boundary(
                 "val_every": cfg.val_every,
                 "val_n_paths": cfg.val_n_paths,
                 "precompute_center_path": cfg.precompute_center_path, 
+                "true_params": {
+                    "mu1": np.asarray(true_params.mu1, dtype=float).tolist(),
+                    "mu2": np.asarray(true_params.mu2, dtype=float).tolist(),
+                    "Sigma": np.asarray(true_params.Sigma, dtype=float).tolist(),
+                    "lam1": float(true_params.lam1),
+                    "lam2": float(true_params.lam2),
+                    "r": float(true_params.r),
+                },
                 "filter_mode": filter_mode,
                 "filter_params": {
                     k: (v.tolist() if isinstance(v, np.ndarray) else v)
@@ -745,7 +776,9 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight_decay", type=float, default=1e-6)
     ap.add_argument("--gamma_risk", type=float, default=5.0)
-    #ap.add_argument("--qvi_width_floor", type=float, default=1e-4)
+    ap.add_argument("--gap_mode", type=str, choices=["direct", "qvi_exp"], default="direct")
+    ap.add_argument("--qvi_width_floor", type=float, default=1e-4)
+    ap.add_argument("--correction_clip", type=float, default=2.0)
     #ap.add_argument("--boundary_anchor_coef", type=float, default=1e-2)
     ap.add_argument("--turnover_coef", type=float, default=0.0)
     ap.add_argument("--utility_kind", type=str, choices=["log", "sqrt", "power"], default="log")
@@ -779,7 +812,9 @@ def main():
         iters=args.iters,
         episodes_per_iter=args.episodes_per_iter,
         gamma_risk=args.gamma_risk,
-        #qvi_width_floor=args.qvi_width_floor,
+        gap_mode=args.gap_mode,
+        qvi_width_floor=args.qvi_width_floor,
+        correction_clip=args.correction_clip,
         #boundary_anchor_coef=args.boundary_anchor_coef,
         turnover_coef=args.turnover_coef,
         utility_kind=args.utility_kind,

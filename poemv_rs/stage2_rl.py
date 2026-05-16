@@ -278,6 +278,31 @@ def _normal_log_prob(x: torch.Tensor, mu: torch.Tensor, log_std: torch.Tensor) -
 def _normal_entropy(log_std: torch.Tensor) -> torch.Tensor:
     return (0.5 + 0.5 * np.log(2.0 * np.pi) + log_std).sum(dim=-1)
 
+def _squashed_normal_sample_and_logprob(
+    mu: torch.Tensor,
+    log_std: torch.Tensor,
+    deterministic: bool = False,
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sample raw Gaussian action u, squash with tanh to a in (-1, 1),
+    and return:
+        raw_u, squashed_a, logprob(a)
+    using the standard tanh-squash correction.
+    """
+    std = torch.exp(log_std)
+    if deterministic:
+        raw_u = mu
+    else:
+        raw_u = mu + std * torch.randn_like(mu)
+
+    squashed_a = torch.tanh(raw_u)
+    raw_logp = _normal_log_prob(raw_u, mu, log_std)
+    # sum log |da/du| = sum log(1 - tanh(u)^2)
+    correction = torch.log(torch.clamp(1.0 - squashed_a.pow(2), min=eps)).sum(dim=-1)
+    squashed_logp = raw_logp - correction
+    return raw_u, squashed_a, squashed_logp
+
 
 # =========================
 # Trajectory rollout
@@ -332,18 +357,15 @@ def rollout_episode_rl(
         with torch.no_grad():
             mu, log_std = actor(obs_t)
             value = critic(obs_t)
-
-            if deterministic:
-                action_t = mu
-            else:
-                eps = torch.randn_like(mu)
-                action_t = mu + torch.exp(log_std) * eps
-
-            logp_t = _normal_log_prob(action_t, mu, log_std)
+            raw_u_t, action_t, logp_t = _squashed_normal_sample_and_logprob(
+                mu=mu,
+                log_std=log_std,
+                deterministic=deterministic,
+            )
 
         action_np = action_t.squeeze(0).detach().cpu().numpy()
-        lower_log_scale = np.clip(action_np[:2], -cfg.log_scale_clip, cfg.log_scale_clip)
-        upper_log_scale = np.clip(action_np[2:], -cfg.log_scale_clip, cfg.log_scale_clip)
+        lower_log_scale = cfg.log_scale_clip * action_np[:2]
+        upper_log_scale = cfg.log_scale_clip * action_np[2:]
 
         base_width = _qvi_base_width(
             center_w=center_w,
@@ -485,7 +507,12 @@ def _ppo_update(
 
     for _ in range(cfg.ppo_epochs):
         mu, log_std = actor(obs_t)
-        new_logp = _normal_log_prob(actions_t, mu, log_std)
+        # actions_t stores squashed actions in (-1, 1); invert through atanh
+        a = torch.clamp(actions_t, min=-1.0 + 1e-6, max=1.0 - 1e-6)
+        raw_u = 0.5 * (torch.log1p(a) - torch.log1p(-a))  # atanh(a)
+        raw_logp = _normal_log_prob(raw_u, mu, log_std)
+        correction = torch.log(torch.clamp(1.0 - a.pow(2), min=1e-8)).sum(dim=-1)
+        new_logp = raw_logp - correction
         ratio = torch.exp(new_logp - old_logp_t)
         surr1 = ratio * adv_t
         surr2 = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * adv_t

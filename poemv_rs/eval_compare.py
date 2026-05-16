@@ -346,9 +346,9 @@ def simulate_method_on_path(
         pk = belief[k]
 
         if (k % step_reb) == 0:
-            if method == "RLMean":
+            if method == "RL":
                 if agent is None:
-                    raise ValueError("RLMean method requires a loaded agent.")
+                    raise ValueError("RL method requires a loaded agent.")
                 current_u = rl_action(agent, tk, xk, pk, deterministic=True)
                 current_u = scale_action_to_leverage_cap(current_u, xk, leverage_cap)
             elif method == "RLSample":
@@ -615,6 +615,10 @@ def summarize_results(results: List[Dict]) -> pd.DataFrame:
         var_xT = float(np.var(xT, ddof=1)) if len(xT) > 1 else 0.0
         std_xT = float(np.std(xT, ddof=1)) if len(xT) > 1 else 0.0
         terminal_sharpe = float((mean_xT - 1.0) / std_xT) if std_xT > 1e-12 else np.nan
+        target_z = float(items[0].get("target_z", 1.2)) if len(items) > 0 else 1.2
+        p_hit_target = float(np.mean(xT >= target_z))
+        shortfall = float(np.mean(np.maximum(target_z - xT, 0.0)))
+        target_sharpe_like = float((mean_xT - target_z) / std_xT) if std_xT > 1e-12 else np.nan
 
         rows.append(
             {
@@ -626,6 +630,9 @@ def summarize_results(results: List[Dict]) -> pd.DataFrame:
                 "variance_terminal": var_xT,
                 "std_terminal": std_xT,
                 "terminal_sharpe": terminal_sharpe,
+                "p_hit_target": p_hit_target,
+                "shortfall": shortfall,
+                "target_sharpe_like": target_sharpe_like,
                 "avg_path_sharpe_ann": float(np.nanmean(path_sharpes)),
                 "p05_terminal": float(np.quantile(xT, 0.05)),
                 "p50_terminal": float(np.quantile(xT, 0.50)),
@@ -702,21 +709,24 @@ def save_terminal_histograms(results: List[Dict], outdir: Path):
                 continue
             methods = list(sub["method"].drop_duplicates())
             fig = plt.figure(figsize=(10, 6))
-            for method in methods:
-                x = sub.loc[sub["method"] == method, "terminal_wealth"].values
-                plt.hist(
-                    x,
-                    bins=30,
-                    #histtype="step",
-                    #linewidth=2,
-                    alpha=0.35,
-                    density=False,
-                    label=method,
-                )
-                plt.axvline(float(np.mean(x)), linestyle="--", linewidth=1.5)
+            color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", None)
+            for idx, method in enumerate(sub["method"].drop_duplicates()):
+                arr = sub.loc[sub["method"] == method, "terminal_wealth"].values
+                color = None if color_cycle is None else color_cycle[idx % len(color_cycle)]
+                mean_val = float(np.mean(arr))
+                std_val = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
+                plt.hist(arr, bins=30, alpha=0.35, density=False, color=color, label=None)
+                plt.axvline(
+                    mean_val,
+                    linestyle="--",
+                    linewidth=2.0,
+                    color=color,
+                    alpha=0.9,
+                    label=f"{method} mean={mean_val:.3f}, std={std_val:.3f}",
+                    )
             plt.xlabel("terminal wealth")
             plt.ylabel("count")
-            plt.title(f"Terminal wealth histogram | {reb} | lev={lev}")
+            plt.title(f"Terminal wealth histogram")
             plt.legend()
             fig.tight_layout()
             fig.savefig(outdir / f"terminal_hist_{reb}_lev_{lev}.png", dpi=200)
@@ -770,13 +780,13 @@ def save_average_wealth_plot(
         t = [r["t"] for r in subset if r["method"] == method][0]
         mat = np.stack(mats, axis=0)
         avg_series = np.mean(mat, axis=0)
-        std_series = np.std(mat, axis=0, ddof=0)
-        plt.plot(t, avg_series, label=method)
+        #std_series = np.std(mat, axis=0, ddof=0)
+        #plt.plot(t, avg_series, label=method)
         #plt.fill_between(t,avg_series - std_series,avg_series + std_series,alpha=0.15,label="_nolegend_",)
         plt.plot(t, avg_series, label=method)
     plt.xlabel("time (years)")
     plt.ylabel("discounted wealth")
-    plt.title(f"Average wealth paths | {rebalance_label} | lev={leverage_cap_label}")
+    plt.title(f"Average wealth paths")
     plt.legend()
     fig.tight_layout()
     fig.savefig(outdir / f"avg_wealth_paths_{rebalance_label}_lev_{leverage_cap_label}.png", dpi=200)
@@ -823,12 +833,11 @@ def save_stage1_diagnostic_panel(
     p0: float = 0.5,
 ):
     """
-    Stage2-style diagnostic for Stage1 center policy:
-      - true regime shading
-      - belief p_t
-      - raw action u_t
-      - normalized weight u_t / x_t
-    One figure per asset.
+    Four-panel Stage1 diagnostic for the common-covariance model:
+      1) wealth
+      2) belief p_t
+      3) raw risky action u_t
+      4) normalized risky weights u_t / x_t, plus cash and total
     """
     n = path["ret"].shape[0]
     dt = float(path["t"][1] - path["t"][0])
@@ -852,34 +861,53 @@ def save_stage1_diagnostic_panel(
         w_hist[k] = w
         wealth[k + 1] = xk + float(np.dot(u, path["ret"][k]))
 
-    for j in range(2):
-        fig, ax1 = plt.subplots(figsize=(11, 5))
+    total = np.sum(w_hist, axis=1)
+    cash = 1.0 - total
 
-        start = 0
-        for k in range(1, n + 1):
-            if k == n or regime_true[k] != regime_true[start]:
-                color = "green" if regime_true[start] == 1 else "red"
-                ax1.axvspan(t[start], t[k - 1], alpha=0.08, color=color)
-                start = k
+    fig = plt.figure(figsize=(11, 10))
 
-        ax1.plot(t, u_hist[:, j], label=f"raw_u[{j}]", linewidth=1.8)
-        ax1.plot(t, w_hist[:, j], label=f"weight[{j}]", linewidth=1.8)
-        ax1.set_xlabel("time (years)")
-        ax1.set_ylabel(f"asset {j+1}: raw u / weight")
+    # 1) wealth
+    ax1 = plt.subplot(4, 1, 1)
+    ax1.plot(path["t"], wealth, label="wealth")
+    ax1.set_ylabel("wealth")
+    ax1.legend(loc="best")
 
-        ax2 = ax1.twinx()
-        ax2.plot(t, belief, linestyle=":", linewidth=1.8, label="belief p_t")
-        ax2.set_ylabel("belief / regime")
-        ax2.set_ylim(-0.05, 1.05)
+    # 2) belief with regime shading
+    ax2 = plt.subplot(4, 1, 2, sharex=ax1)
+    start = 0
+    for k in range(1, n + 1):
+        if k == n or regime_true[k] != regime_true[start]:
+            color = "green" if regime_true[start] == 1 else "red"
+            ax2.axvspan(t[start], t[k - 1], alpha=0.08, color=color)
+            start = k
+    ax2.plot(t, belief, label="belief p_t")
+    ax2.set_ylabel("belief")
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.legend(loc="best")
 
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
-        ax1.set_title(f"stage1_diagnostic: asset {j+1}")
+    # 3) raw risky action
+    ax3 = plt.subplot(4, 1, 3, sharex=ax1)
+    for j in range(u_hist.shape[1]):
+        ax3.plot(t, u_hist[:, j], label=f"u{j+1}")
+    ax3.axhline(0.0, color="black", linestyle="-", linewidth=0.8, alpha=0.5)
+    ax3.set_ylabel("raw action")
+    ax3.legend(loc="best")
 
-        fig.tight_layout()
-        fig.savefig(outdir / f"stage1_diagnostic_asset{j+1}.png", dpi=200)
-        plt.close(fig)
+    # 4) normalized weights + cash + total
+    ax4 = plt.subplot(4, 1, 4, sharex=ax1)
+    for j in range(w_hist.shape[1]):
+        ax4.plot(t, w_hist[:, j], label=f"w{j+1}")
+    ax4.plot(t, cash, label="cash", linestyle="--")
+    ax4.plot(t, total, label="total", linestyle=":")
+    ax4.axhline(1.0, color="gray", linestyle=":", linewidth=1.0, alpha=0.8)
+    ax4.axhline(0.0, color="black", linestyle="-", linewidth=0.8, alpha=0.5)
+    ax4.set_ylabel("norm. weights")
+    ax4.set_xlabel("time (years)")
+    ax4.legend(loc="best", ncol=2)
+
+    fig.tight_layout()
+    fig.savefig(outdir / "stage1_diagnostic_panel.png", dpi=200)
+    plt.close(fig)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -946,10 +974,14 @@ def main():
     #leverage_caps: List[Optional[float]] = [None, 2.0, 3.0]
     #methods = ["RLMean", "RLSample", "EW", "MinVar", "MeanVar"]
     leverage_caps: List[Optional[float]] = [args.leverage_cap]
-    methods = ["RLMean", "EW", "MinVar", "MeanVar"]
+    methods = ["RL", "EW", "MinVar",
+               #"MeanVar"
+               ]
     if args.include_rlsample:
         methods.insert(1, "RLSample")
-    rebalances = ["daily", "monthly"]
+    rebalances = ["daily", 
+                  #"monthly"
+                  ]
 
     results: List[Dict] = []
     #representative_path_ids = list(range(min(4, args.n_paths)))
@@ -976,7 +1008,7 @@ def main():
                         z=args.z,
                         leverage_cap=lev,
                         rebalance_label=reb,
-                        agent=agent if method in ("RLMean", "RLSample") else None,
+                        agent=agent if method in ("RL", "RLSample") else None,
                         p0=args.p0,
                         x0=args.x0,
                     )
@@ -986,6 +1018,7 @@ def main():
                             "rebalance": reb,
                             "leverage_cap_label": lev_label,
                             "path_id": path_id,
+                            "target_z": float(args.z),
                             "t": path["t"],
                             **sim,
                         }

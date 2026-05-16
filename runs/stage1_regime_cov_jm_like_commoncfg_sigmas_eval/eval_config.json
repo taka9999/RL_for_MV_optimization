@@ -1,0 +1,20 @@
+{
+  "run_dir": "runs/stage1_regime_cov_jm_like_commoncfg_sigmas",
+  "checkpoint": "runs/stage1_regime_cov_jm_like_commoncfg_sigmas/best_checkpoint.pt",
+  "belief_mode": "estimated_params",
+  "n_paths": 512,
+  "T": 1.0,
+  "dt": 0.003968253968253968,
+  "x0": 1.0,
+  "p0": 0.5,
+  "z": 1.2,
+  "r": 0.01,
+  "a_max": 1.0,
+  "leverage_cap": null,
+  "include_ew": true,
+  "include_gmv": true,
+  "include_mv": false,
+  "sigma_mode": "regime",
+  "cov_mode": "belief_avg_regime",
+  "estimation_method": "jump_model"
+}
