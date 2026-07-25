@@ -1,6 +1,14 @@
 from __future__ import annotations
 import argparse
 import json
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import torch
@@ -592,6 +600,100 @@ def make_estimated_params_via_jump_model(
         r=float(true_params.r),
     )
 
+def _get_git_info() -> tuple[str, str]:
+    """Best-effort git commit hash / branch of the current working tree. Never raises."""
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        return commit, branch
+    except Exception:
+        return "unknown", "unknown"
+
+
+def _values_equal(a, b) -> bool:
+    """Deep-ish equality for run-config comparison: dicts recurse, numpy arrays use
+    allclose, floats use isclose, everything else falls back to ==."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        if set(a.keys()) != set(b.keys()):
+            return False
+        return all(_values_equal(a[k], b[k]) for k in a)
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        try:
+            return bool(np.allclose(np.asarray(a, dtype=float), np.asarray(b, dtype=float), equal_nan=True))
+        except (TypeError, ValueError):
+            return False
+    if a is None or b is None:
+        return a is b
+    if isinstance(a, (int, float)) or isinstance(b, (int, float)):
+        try:
+            return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-12)
+        except (TypeError, ValueError):
+            return a == b
+    return a == b
+
+
+def _configs_match(current: dict, saved: dict) -> list[str]:
+    """Return the list of mismatched top-level keys between two run-config dicts
+    (empty list means they match on every field that affects training semantics)."""
+    mismatches = []
+    for k in sorted(set(current.keys()) | set(saved.keys())):
+        if k not in current or k not in saved:
+            mismatches.append(f"{k} (present on only one side)")
+            continue
+        if not _values_equal(current[k], saved[k]):
+            mismatches.append(k)
+    return mismatches
+
+
+def _atomic_torch_save(obj, path: Path):
+    path = Path(path)
+    tmp_path = path.with_name(path.name + f".tmp{os.getpid()}")
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _atomic_csv_write(df: pd.DataFrame, path: Path):
+    path = Path(path)
+    tmp_path = path.with_name(path.name + f".tmp{os.getpid()}")
+    df.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, path)
+
+
+def _capture_rng_state() -> dict:
+    return {
+        "rng_python": random.getstate(),
+        "rng_numpy": np.random.get_state(),
+        "rng_torch": torch.get_rng_state(),
+        "rng_torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _save_checkpoint(path: Path, *, iter_num: int, agent, last_terminals: list,
+                      run_config_dict: dict, git_commit: str, git_branch: str):
+    ckpt = {
+        "iter": int(iter_num),
+        "vf_state_dict": agent.vf.state_dict(),
+        "pi_state_dict": agent.pi.state_dict(),
+        "opt_theta_state_dict": agent.opt_theta.state_dict(),
+        "opt_phi_state_dict": agent.opt_phi.state_dict(),
+        "omega": float(agent.omega.detach().cpu()),
+        "mean_xT_ema": agent.mean_xT_ema,
+        "last_terminals": list(last_terminals),
+        "sched_theta_state_dict": agent.sched_theta.state_dict() if agent.sched_theta is not None else None,
+        "sched_phi_state_dict": agent.sched_phi.state_dict() if agent.sched_phi is not None else None,
+        "run_config": run_config_dict,
+        "git_commit": git_commit,
+        "git_branch": git_branch,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        **_capture_rng_state(),
+    }
+    _atomic_torch_save(ckpt, path)
+
+
 def train(mode: str, iters: int, seed: int, outdir: Path,
           alpha_theta: float, alpha_phi: float, alpha_w: float,
           Lambda: float, omega_update_every: int,
@@ -615,6 +717,8 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
           est_sigma: np.ndarray | None = None,
           est_lam1: float | None = None,
           est_lam2: float | None = None,
+          checkpoint_every: int = 250,
+          resume_from: str | None = None,
           ):
     set_seed(seed)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -671,11 +775,112 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
                         )
     agent = POEMVAgent(cfg)
 
+    git_commit, git_branch = _get_git_info()
+    run_config_dict = dict(
+        mode=mode, seed=seed, iters=iters,
+        episodes_per_iter=episodes_per_iter,
+        estimation_method=estimation_method,
+        apply_action_projection=apply_action_projection,
+        T=episode_T_years, dt=dt, a_max=a_max, cap_mode=cap_mode, r=r,
+        x0=cfg.x0, p0=cfg.p0, z=cfg.z,
+        Lambda=Lambda,
+        alpha_theta=alpha_theta, alpha_phi=alpha_phi, alpha_w=alpha_w,
+        omega_update_every=omega_update_every,
+        critic_steps=critic_steps,
+        advantage_norm_eps=advantage_norm_eps,
+        omega_ema_beta=omega_ema_beta,
+        g_p_dep=g_p_dep,
+        actor_mix_tail=actor_mix_tail,
+        cov_scale=cov_scale,
+        lr_step_every=lr_step_every,
+        lr_gamma=lr_gamma,
+        policy_params=policy_params.__dict__,
+        true_params=true_params.__dict__,
+        filter_params=filt_params.__dict__,
+        estimated_params=est_params.__dict__,
+    )
+
     rows = []
     last_terminals = []
     last_mean_xT_window = float("nan")
     last_gap = float("nan")
     last_domega = 0.0
+    start_iter = 1
+
+    if resume_from:
+        ckpt = torch.load(resume_from, map_location=cfg.device, weights_only=False)
+
+        required_keys = [
+            "opt_theta_state_dict", "opt_phi_state_dict",
+            "rng_python", "rng_numpy", "rng_torch",
+            "last_terminals", "run_config", "git_commit", "iter",
+        ]
+        missing = [k for k in required_keys if k not in ckpt or ckpt[k] is None]
+        if missing:
+            raise RuntimeError(
+                f"Refusing to resume from {resume_from}: checkpoint is missing required "
+                f"state for exact resume: {missing}. This is not an 'exact resume' - "
+                "the checkpoint predates the fault-tolerance changes or is otherwise "
+                "incomplete. Re-run from iteration 0 instead."
+            )
+
+        mismatches = _configs_match(run_config_dict, ckpt["run_config"])
+        if ckpt["git_commit"] != git_commit:
+            mismatches.append(f"git_commit: checkpoint={ckpt['git_commit']} current={git_commit}")
+        if mismatches:
+            raise RuntimeError(
+                f"Refusing to resume from {resume_from}: checkpoint config/commit does not "
+                f"match the current invocation. Mismatched fields: {mismatches}"
+            )
+
+        metrics_path = outdir / "metrics.csv"
+        if not metrics_path.exists():
+            raise RuntimeError(
+                f"Refusing to resume from {resume_from}: {metrics_path} not found, cannot "
+                "guarantee no loss of existing metrics history."
+            )
+
+        agent.vf.load_state_dict(ckpt["vf_state_dict"])
+        agent.pi.load_state_dict(ckpt["pi_state_dict"])
+        agent.opt_theta.load_state_dict(ckpt["opt_theta_state_dict"])
+        agent.opt_phi.load_state_dict(ckpt["opt_phi_state_dict"])
+        agent.omega = torch.tensor(ckpt["omega"], dtype=cfg.dtype, device=cfg.device)
+        agent.mean_xT_ema = ckpt.get("mean_xT_ema")
+        if agent.sched_theta is not None:
+            if ckpt.get("sched_theta_state_dict") is None:
+                raise RuntimeError(
+                    f"Refusing to resume from {resume_from}: current config expects an "
+                    "LR scheduler but checkpoint has no sched_theta_state_dict."
+                )
+            agent.sched_theta.load_state_dict(ckpt["sched_theta_state_dict"])
+        if agent.sched_phi is not None:
+            if ckpt.get("sched_phi_state_dict") is None:
+                raise RuntimeError(
+                    f"Refusing to resume from {resume_from}: current config expects an "
+                    "LR scheduler but checkpoint has no sched_phi_state_dict."
+                )
+            agent.sched_phi.load_state_dict(ckpt["sched_phi_state_dict"])
+        last_terminals = list(ckpt["last_terminals"])
+
+        # Reseed exactly as at process start, then overwrite with the checkpointed
+        # RNG state so we continue the SAME stream rather than restarting it.
+        set_seed(seed)
+        random.setstate(ckpt["rng_python"])
+        np.random.set_state(ckpt["rng_numpy"])
+        torch.set_rng_state(ckpt["rng_torch"])
+        if torch.cuda.is_available() and ckpt.get("rng_torch_cuda") is not None:
+            torch.cuda.set_rng_state_all(ckpt["rng_torch_cuda"])
+
+        start_iter = int(ckpt["iter"]) + 1
+        existing_df = pd.read_csv(metrics_path)
+        existing_df = existing_df[existing_df["iter"] <= ckpt["iter"]]
+        rows = existing_df.to_dict("records")
+        _atomic_csv_write(existing_df, metrics_path)
+        print(
+            f"[resume] restored from {resume_from} at iter={ckpt['iter']} "
+            f"(saved {ckpt.get('timestamp_utc')}); resuming at iter={start_iter}",
+            flush=True,
+        )
 
     def _episode_position_stats(traj):
         """
@@ -702,7 +907,8 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             "min_cash_weight": float(np.min(cash_w)),
         }
 
-    for m in range(1, iters+1):
+    _train_start_time = time.time()
+    for m in range(start_iter, iters+1):
         batch_xT = []
         batch_pos_stats = []
         batch_trajs = []
@@ -820,6 +1026,28 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         if m % max(100, omega_update_every) == 0:
             pd.DataFrame(rows).to_csv(outdir/"metrics.csv", index=False)
 
+        if checkpoint_every and checkpoint_every > 0 and (m % checkpoint_every == 0):
+            ckpt_path = outdir / f"checkpoint_iter_{m:07d}.pt"
+            _save_checkpoint(ckpt_path, iter_num=m, agent=agent, last_terminals=last_terminals,
+                              run_config_dict=run_config_dict, git_commit=git_commit, git_branch=git_branch)
+            _save_checkpoint(outdir / "checkpoint_latest.pt", iter_num=m, agent=agent,
+                              last_terminals=last_terminals, run_config_dict=run_config_dict,
+                              git_commit=git_commit, git_branch=git_branch)
+            pd.DataFrame(rows).to_csv(outdir/"metrics.csv", index=False)
+            elapsed = time.time() - _train_start_time
+            iters_done_this_run = max(m - start_iter + 1, 1)
+            sec_per_iter = elapsed / iters_done_this_run
+            eta_sec = sec_per_iter * max(iters - m, 0)
+            print(
+                f"[{datetime.now(timezone.utc).isoformat()}] iter={m}/{iters} "
+                f"loss_critic={loss_c:.6g} loss_actor={loss_a:.6g} "
+                f"omega={float(agent.omega.detach().cpu()):.6g} "
+                f"mean_terminal={float(np.mean(last_terminals)):.6g} "
+                f"elapsed_s={elapsed:.1f} eta_s={eta_sec:.1f} checkpoint={ckpt_path}",
+                flush=True,
+            )
+            sys.stdout.flush()
+
     df = pd.DataFrame(rows)
     df.to_csv(outdir/"metrics.csv", index=False)
 
@@ -834,7 +1062,6 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
     plt.close(fig)
 
     with open(outdir/"run_config.json","w",encoding="utf-8") as f:
-        import json
         def _json_default(o):
             # numpy arrays / scalars -> python native
             if isinstance(o, np.ndarray):
@@ -842,37 +1069,16 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             if isinstance(o, (np.floating, np.integer)):
                 return o.item()
             raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
-        json.dump(dict(
-            mode=mode, seed=seed, iters=iters,
-            episodes_per_iter=episodes_per_iter,
-            estimation_method=estimation_method,
-            apply_action_projection=apply_action_projection,
-            T=episode_T_years, dt=dt, a_max=a_max, cap_mode=cap_mode, r=r,
-            x0=cfg.x0, p0=cfg.p0, z=cfg.z,
-            Lambda=Lambda,
-            alpha_theta=alpha_theta, alpha_phi=alpha_phi, alpha_w=alpha_w,
-            omega_update_every=omega_update_every,
-            critic_steps=critic_steps,
-            advantage_norm_eps=advantage_norm_eps,
-            omega_ema_beta=omega_ema_beta,
-            g_p_dep=g_p_dep,
-            actor_mix_tail=actor_mix_tail,
-            cov_scale=cov_scale,
-            lr_step_every=lr_step_every,
-            lr_gamma=lr_gamma,
-            policy_params=policy_params.__dict__,
-            true_params=true_params.__dict__,
-            filter_params=filt_params.__dict__,
-            estimated_params=est_params.__dict__,
-        ), f, indent=2, default=_json_default)
-    torch.save(
-        {
-            "vf_state_dict": agent.vf.state_dict(),
-            "pi_state_dict": agent.pi.state_dict(),
-            "omega": float(agent.omega.detach().cpu()),
-        },
-        outdir / "checkpoint.pt",
-    )
+        json.dump(run_config_dict, f, indent=2, default=_json_default)
+
+    # Final checkpoint: same top-level keys as before (vf_state_dict/pi_state_dict/omega)
+    # for backward compatibility with Stage2/eval loaders, plus the full resumable state.
+    _save_checkpoint(outdir / "checkpoint.pt", iter_num=iters, agent=agent,
+                      last_terminals=last_terminals, run_config_dict=run_config_dict,
+                      git_commit=git_commit, git_branch=git_branch)
+    _save_checkpoint(outdir / "checkpoint_latest.pt", iter_num=iters, agent=agent,
+                      last_terminals=last_terminals, run_config_dict=run_config_dict,
+                      git_commit=git_commit, git_branch=git_branch)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -907,6 +1113,12 @@ def main():
     ap.add_argument("--est_sigma_json", type=str, default=None)
     ap.add_argument("--est_lam1", type=float, default=None)
     ap.add_argument("--est_lam2", type=float, default=None)
+    ap.add_argument("--checkpoint_every", type=int, default=250,
+                     help="Save a full resumable checkpoint every N iterations (atomic write).")
+    ap.add_argument("--resume_from", type=str, default=None,
+                     help="Path to a checkpoint (e.g. checkpoint_latest.pt) to resume an "
+                          "interrupted run from. Aborts if the checkpoint's config/git commit "
+                          "does not match this invocation, or if required state is missing.")
     args = ap.parse_args()
     train(args.mode, args.iters, args.seed, Path(args.outdir), args.alpha_theta, args.alpha_phi, args.alpha_w,
           args.Lambda, args.omega_update_every, episode_T_years=args.T, dt=args.dt,z = args.z, a_max=args.a_max,
@@ -927,7 +1139,15 @@ def main():
           est_mu2=np.array(json.loads(args.est_mu2_json)) if args.est_mu2_json else None,
           est_sigma=np.array(json.loads(args.est_sigma_json)) if args.est_sigma_json else None,
           est_lam1=args.est_lam1, est_lam2=args.est_lam2,
+          checkpoint_every=args.checkpoint_every,
+          resume_from=args.resume_from,
           )
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        print("[FATAL] uncaught exception in poemv_rs.train:", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        raise
