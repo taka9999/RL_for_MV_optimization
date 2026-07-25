@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import json
 import numpy as np
 import pandas as pd
 import torch
@@ -609,6 +610,11 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
           episodes_per_iter: int = 1,
           apply_action_projection: bool = True,
           estimation_method: str = "heuristic",
+          est_mu1: np.ndarray | None = None,
+          est_mu2: np.ndarray | None = None,
+          est_sigma: np.ndarray | None = None,
+          est_lam1: float | None = None,
+          est_lam2: float | None = None,
           ):
     set_seed(seed)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -625,7 +631,10 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
         filt_params = FilterParams(mu1=true_params.mu1, mu2=true_params.mu2, Sigma=true_params.Sigma,
                                    lam1=true_params.lam1, lam2=true_params.lam2, r=true_params.r)
     elif mode == "estimated_params":
-        if estimation_method == "heuristic":
+        if est_mu1 is not None:
+            est_params = RSGBMParams(mu1=est_mu1, mu2=est_mu2, Sigma=est_sigma,
+                                      lam1=est_lam1, lam2=est_lam2, r=r)
+        elif estimation_method == "heuristic":
             est_params = make_estimated_params_via_heuristic(true_params, seed=seed)
         elif estimation_method == "hmm":
             est_params = make_estimated_params_via_hmm(true_params, seed=seed)
@@ -835,6 +844,9 @@ def train(mode: str, iters: int, seed: int, outdir: Path,
             raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
         json.dump(dict(
             mode=mode, seed=seed, iters=iters,
+            episodes_per_iter=episodes_per_iter,
+            estimation_method=estimation_method,
+            apply_action_projection=apply_action_projection,
             T=episode_T_years, dt=dt, a_max=a_max, cap_mode=cap_mode, r=r,
             x0=cfg.x0, p0=cfg.p0, z=cfg.z,
             Lambda=Lambda,
@@ -890,6 +902,11 @@ def main():
     ap.add_argument("--z", type=float, default=1.2)
     ap.add_argument("--apply_action_projection", action="store_true")
     ap.add_argument("--estimation_method", type=str, choices=["heuristic", "hmm", "jump_model"], default="heuristic")
+    ap.add_argument("--est_mu1_json", type=str, default=None)
+    ap.add_argument("--est_mu2_json", type=str, default=None)
+    ap.add_argument("--est_sigma_json", type=str, default=None)
+    ap.add_argument("--est_lam1", type=float, default=None)
+    ap.add_argument("--est_lam2", type=float, default=None)
     args = ap.parse_args()
     train(args.mode, args.iters, args.seed, Path(args.outdir), args.alpha_theta, args.alpha_phi, args.alpha_w,
           args.Lambda, args.omega_update_every, episode_T_years=args.T, dt=args.dt,z = args.z, a_max=args.a_max,
@@ -905,7 +922,11 @@ def main():
           episodes_per_iter=args.episodes_per_iter,
           cap_mode=args.cap_mode,
           apply_action_projection=args.apply_action_projection,
-          estimation_method=args.estimation_method
+          estimation_method=args.estimation_method,
+          est_mu1=np.array(json.loads(args.est_mu1_json)) if args.est_mu1_json else None,
+          est_mu2=np.array(json.loads(args.est_mu2_json)) if args.est_mu2_json else None,
+          est_sigma=np.array(json.loads(args.est_sigma_json)) if args.est_sigma_json else None,
+          est_lam1=args.est_lam1, est_lam2=args.est_lam2,
           )
 
 if __name__ == "__main__":

@@ -277,6 +277,19 @@ def compute_belief_path(logret: np.ndarray, filt_params: FilterParams, dt: float
     return p
 
 
+def compute_belief_path_full_information_oracle(I_true: np.ndarray) -> np.ndarray:
+    """Evaluation-only approximate reference upper bound.
+
+    Substitutes the Bayes-filtered belief with the true-regime indicator
+    1{I_true=1}. This is NOT a from-scratch full-information-optimal
+    policy: it evaluates the already-trained (partial-information) policy
+    at an oracle belief input. Must never be conflated with the
+    "true_params" filter mode (A), which still filters.
+    """
+    I_true = np.asarray(I_true, dtype=int).reshape(-1)
+    return (I_true == 1).astype(float)
+
+
 def rebalance_steps(label: str) -> int:
     label = label.lower()
     if label == "daily":
@@ -322,10 +335,16 @@ def simulate_method_on_path(
     agent: Optional[POEMVAgent] = None,
     p0: float = 0.5,
     x0: float = 1.0,
+    belief_override: Optional[np.ndarray] = None,
 ) -> Dict[str, np.ndarray]:
     n = path["ret"].shape[0]
     step_reb = rebalance_steps(rebalance_label)
-    belief = compute_belief_path(path["logret"], filt_params=filt_params, dt=dt, p0=p0)
+    if belief_override is not None:
+        # Evaluation-only override (e.g. full-information-oracle belief).
+        # Bypasses filtering entirely; filt_params is unused in this branch.
+        belief = np.asarray(belief_override, dtype=float)
+    else:
+        belief = compute_belief_path(path["logret"], filt_params=filt_params, dt=dt, p0=p0)
 
     wealth = np.empty(n + 1, dtype=float)
     gross_lev = np.empty(n, dtype=float)
@@ -924,6 +943,20 @@ def main():
     ap.add_argument("--a_max", type=float, default=2.0)
     ap.add_argument("--r", type=float, default=0.01)
     ap.add_argument("--filter_mode", type=str, choices=["true_params", "estimated_params"], default="true_params")
+    ap.add_argument(
+        "--belief_source",
+        type=str,
+        choices=["filtered", "full_information_oracle"],
+        default="filtered",
+        help=(
+            "'filtered' (default): belief comes from the Bayes filter under --filter_mode "
+            "(true_params or estimated_params, both partial information). "
+            "'full_information_oracle': evaluation-only approximate reference upper bound; "
+            "the already-trained policy is fed the true-regime indicator instead of a "
+            "filtered belief. Not a from-scratch full-information-optimal policy, and not "
+            "to be confused with --filter_mode true_params (which still filters)."
+        ),
+    )
     ap.add_argument("--plot_center_policy_diagnostics", action="store_true")
     ap.add_argument("--plot_stage1_diagnostic", action="store_true")
     ap.add_argument("--diagnostic_path_id", type=int, default=0)
@@ -997,6 +1030,9 @@ def main():
         for reb in rebalances:
             for lev in leverage_caps:
                 lev_label = "none" if lev is None else str(float(lev))
+                belief_override = None
+                if args.belief_source == "full_information_oracle":
+                    belief_override = compute_belief_path_full_information_oracle(path["I"])
                 for method in methods:
                     sim = simulate_method_on_path(
                         method=method,
@@ -1011,6 +1047,7 @@ def main():
                         agent=agent if method in ("RL", "RLSample") else None,
                         p0=args.p0,
                         x0=args.x0,
+                        belief_override=belief_override,
                     )
                     results.append(
                         {
@@ -1019,6 +1056,7 @@ def main():
                             "leverage_cap_label": lev_label,
                             "path_id": path_id,
                             "target_z": float(args.z),
+                            "belief_source": args.belief_source,
                             "t": path["t"],
                             **sim,
                         }
@@ -1126,6 +1164,7 @@ def main():
                 "leverage_caps": ["none" if args.leverage_cap is None else float(args.leverage_cap)],
                 "include_rlsample": bool(args.include_rlsample),
                 "filter_mode": args.filter_mode,
+                "belief_source": args.belief_source,
                 "plot_center_policy_diagnostics": bool(args.plot_center_policy_diagnostics),
                 "diagnostic_path_id": args.diagnostic_path_id,
             },

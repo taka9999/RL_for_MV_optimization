@@ -218,11 +218,16 @@ def _simulate_center_only(center_agent, path, filt_params, T_years, dt, x0):
         prev_u = u.copy()
         disc_ret = np.exp(path["logret"][k] - filt_params.r * dt) - 1.0
         wealth[k + 1] = xk + float(np.dot(u, disc_ret))
+    # No transaction cost in this simulator, so gross == net by construction.
+    wealth_gross = wealth.copy()
+    num_trades = int(np.sum(turnover > 1e-9))
     return {
         "wealth": wealth,
         "gross_lev": gross_lev,
         "cash_w": cash_w,
         "turnover": turnover,
+        "wealth_gross": wealth_gross,
+        "num_trades": num_trades,
     }
 
 def _simulate_center_only_with_cost(
@@ -240,6 +245,8 @@ def _simulate_center_only_with_cost(
     belief = compute_belief_path(path["logret"], filt_params=filt_params, dt=dt, p0=0.5)
     wealth = np.empty(n + 1, dtype=float)
     wealth[0] = x0
+    wealth_gross = np.empty(n + 1, dtype=float)
+    wealth_gross[0] = x0
     current_u = np.zeros(2, dtype=float)
     gross_lev = np.empty(n, dtype=float)
     cash_w = np.empty(n, dtype=float)
@@ -271,12 +278,18 @@ def _simulate_center_only_with_cost(
 
         disc_ret = np.exp(path["logret"][k] - filt_params.r * dt) - 1.0
         wealth[k + 1] = xk + float(np.dot(current_u, disc_ret)) - tc
+        # Same realized trades (current_u) and market return, but never
+        # deduct the transaction cost: wealth_gross - wealth == cumulative TC.
+        wealth_gross[k + 1] = wealth_gross[k] + float(np.dot(current_u, disc_ret))
 
+    num_trades = int(np.sum(turnover > 1e-9))
     return {
         "wealth": wealth,
         "gross_lev": gross_lev,
         "cash_w": cash_w,
         "turnover": turnover,
+        "wealth_gross": wealth_gross,
+        "num_trades": num_trades,
     }
 
 
@@ -295,10 +308,13 @@ def _simulate_center_only_fixed_band(
     belief = compute_belief_path(path["logret"], filt_params=filt_params, dt=dt, p0=0.5)
     wealth = np.empty(n + 1, dtype=float)
     wealth[0] = x0
+    wealth_gross = np.empty(n + 1, dtype=float)
+    wealth_gross[0] = x0
     current_u = np.zeros(2, dtype=float)
     gross_lev = np.empty(n, dtype=float)
     cash_w = np.empty(n, dtype=float)
     turnover = np.empty(n, dtype=float)
+    band_width = np.empty(n, dtype=float)
 
     for k in range(n):
         xk = wealth[k]
@@ -311,6 +327,7 @@ def _simulate_center_only_fixed_band(
 
         lower = center_w - halfwidth
         upper = center_w + halfwidth
+        band_width[k] = float(np.mean(upper - lower))
         w_tgt = np.minimum(np.maximum(w_cur, lower), upper)
         if lev_cap is not None:
             w_tgt = apply_leverage_cap_to_weights(w_tgt, lev_cap)
@@ -324,12 +341,17 @@ def _simulate_center_only_fixed_band(
 
         disc_ret = np.exp(path["logret"][k] - filt_params.r * dt) - 1.0
         wealth[k + 1] = xk + float(np.dot(current_u, disc_ret)) - tc
+        wealth_gross[k + 1] = wealth_gross[k] + float(np.dot(current_u, disc_ret))
 
+    num_trades = int(np.sum(turnover > 1e-9))
     return {
         "wealth": wealth,
         "gross_lev": gross_lev,
         "cash_w": cash_w,
         "turnover": turnover,
+        "wealth_gross": wealth_gross,
+        "num_trades": num_trades,
+        "band_width": band_width,
     }
 
 def _simulate_dnn_band(center_agent, model, train_cfg, path, filt_params, T_years, dt, x0, tcost,lev_cap=None):
@@ -337,10 +359,13 @@ def _simulate_dnn_band(center_agent, model, train_cfg, path, filt_params, T_year
     belief = compute_belief_path(path["logret"], filt_params=filt_params, dt=dt, p0=0.5)
     wealth = np.empty(n + 1, dtype=float)
     wealth[0] = x0
+    wealth_gross = np.empty(n + 1, dtype=float)
+    wealth_gross[0] = x0
     current_u = np.zeros(2, dtype=float)
     gross_lev = np.empty(n, dtype=float)
     cash_w = np.empty(n, dtype=float)
     turnover = np.empty(n, dtype=float)
+    band_width = np.empty(n, dtype=float)
 
     model_device = next(model.parameters()).device
     model_dtype = next(model.parameters()).dtype
@@ -376,6 +401,7 @@ def _simulate_dnn_band(center_agent, model, train_cfg, path, filt_params, T_year
         center_t = torch.as_tensor(center_w, dtype=model_dtype, device=model_device)
         lower = (center_t - base_width_t * lower_scale).detach().cpu().numpy()
         upper = (center_t + base_width_t * upper_scale).detach().cpu().numpy()
+        band_width[k] = float(np.mean(upper - lower))
 
         w_tgt = _project_to_band(w_cur, lower, upper)
         if lev_cap is not None:
@@ -389,12 +415,17 @@ def _simulate_dnn_band(center_agent, model, train_cfg, path, filt_params, T_year
 
         disc_ret = np.exp(path["logret"][k] - filt_params.r * dt) - 1.0
         wealth[k + 1] = xk + float(np.dot(current_u, disc_ret)) - tc
+        wealth_gross[k + 1] = wealth_gross[k] + float(np.dot(current_u, disc_ret))
 
+    num_trades = int(np.sum(turnover > 1e-9))
     return {
         "wealth": wealth,
         "gross_lev": gross_lev,
         "cash_w": cash_w,
         "turnover": turnover,
+        "wealth_gross": wealth_gross,
+        "num_trades": num_trades,
+        "band_width": band_width,
     }
 
 def _simulate_direct_boundary(center_agent, model, train_cfg, path, filt_params, T_years, dt, x0, tcost, lev_cap=None):
@@ -402,10 +433,15 @@ def _simulate_direct_boundary(center_agent, model, train_cfg, path, filt_params,
     belief = compute_belief_path(path["logret"], filt_params=filt_params, dt=dt, p0=0.5)
     wealth = np.empty(n + 1, dtype=float)
     wealth[0] = x0
+    wealth_gross = np.empty(n + 1, dtype=float)
+    wealth_gross[0] = x0
     current_u = np.zeros(2, dtype=float)
     gross_lev = np.empty(n, dtype=float)
     cash_w = np.empty(n, dtype=float)
     turnover = np.empty(n, dtype=float)
+    band_width = np.empty(n, dtype=float)
+    lower_hist = np.empty((n, 2), dtype=float)
+    upper_hist = np.empty((n, 2), dtype=float)
 
     model_device = next(model.parameters()).device
     model_dtype = next(model.parameters()).dtype
@@ -429,6 +465,9 @@ def _simulate_direct_boundary(center_agent, model, train_cfg, path, filt_params,
 
         lower = center_w - lower_gap
         upper = center_w + upper_gap
+        lower_hist[k] = lower
+        upper_hist[k] = upper
+        band_width[k] = float(np.mean(upper - lower))
 
         # direct-boundary rebalancing rule
         w_tgt = np.minimum(np.maximum(w_cur, lower), upper)
@@ -443,18 +482,28 @@ def _simulate_direct_boundary(center_agent, model, train_cfg, path, filt_params,
 
         disc_ret = np.exp(path["logret"][k] - filt_params.r * dt) - 1.0
         wealth[k + 1] = xk + float(np.dot(current_u, disc_ret)) - tc
+        wealth_gross[k + 1] = wealth_gross[k] + float(np.dot(current_u, disc_ret))
 
+    num_trades = int(np.sum(turnover > 1e-9))
     return {
         "wealth": wealth,
         "gross_lev": gross_lev,
         "cash_w": cash_w,
         "turnover": turnover,
+        "wealth_gross": wealth_gross,
+        "num_trades": num_trades,
+        "band_width": band_width,
+        "band_lower": lower_hist,
+        "band_upper": upper_hist,
+        "belief": belief,
     }
 
 def _simulate_static(weights, path, filt_params, dt, x0, tcost=0.0, rebalance_every=1):
     n = path["ret"].shape[0]
     wealth = np.empty(n + 1, dtype=float)
     wealth[0] = x0
+    wealth_gross = np.empty(n + 1, dtype=float)
+    wealth_gross[0] = x0
     gross_lev = np.empty(n, dtype=float)
     cash_w = np.empty(n, dtype=float)
     turnover = np.empty(n, dtype=float)
@@ -479,11 +528,15 @@ def _simulate_static(weights, path, filt_params, dt, x0, tcost=0.0, rebalance_ev
         #prev_u = u.copy()
         disc_ret = np.exp(path["logret"][k] - filt_params.r * dt) - 1.0
         wealth[k + 1] = xk + float(np.dot(u, disc_ret)) - tc
+        wealth_gross[k + 1] = wealth_gross[k] + float(np.dot(u, disc_ret))
+    num_trades = int(np.sum(turnover > 1e-9))
     return {
         "wealth": wealth,
         "gross_lev": gross_lev,
         "cash_w": cash_w,
         "turnover": turnover,
+        "wealth_gross": wealth_gross,
+        "num_trades": num_trades,
     }
 
 def _simulate_direct_boundary_diagnostic(center_agent, model, train_cfg, path, filt_params, T_years, dt, x0, tcost, lev_cap=None):
@@ -776,11 +829,24 @@ def main():
             grosslev_by_method[method].append(sim["gross_lev"])
             cash_by_method[method].append(sim["cash_w"])
             turnover_by_method[method].append(sim["turnover"])
+            net_terminal_wealth = float(sim["wealth"][-1])
+            # "wealth_gross" is present for every simulator above (added
+            # additively; equals net wealth where there is no transaction cost).
+            gross_terminal_wealth = float(sim["wealth_gross"][-1])
+            band_width_mean = (
+                float(np.mean(sim["band_width"])) if "band_width" in sim else np.nan
+            )
             rows.append(
                 {
                     "method": method,
                     "path_id": i,
-                    "terminal_wealth": float(sim["wealth"][-1]),
+                    "terminal_wealth": net_terminal_wealth,
+                    "net_terminal_wealth": net_terminal_wealth,
+                    "gross_terminal_wealth": gross_terminal_wealth,
+                    "cumulative_tc": gross_terminal_wealth - net_terminal_wealth,
+                    "gross_minus_net_gap": gross_terminal_wealth - net_terminal_wealth,
+                    "num_trades": int(sim.get("num_trades", -1)),
+                    "mean_band_width": band_width_mean,
                     "gross_lev": float(np.mean(sim["gross_lev"])),
                     "cash_w": float(np.mean(sim["cash_w"])),
                     "turnover": float(np.mean(sim["turnover"])),
@@ -800,9 +866,16 @@ def main():
             mean_gross_lev=("gross_lev", "mean"),
             mean_cash_w=("cash_w", "mean"),
             mean_turnover=("turnover", "mean"),
+            mean_net_terminal_wealth=("net_terminal_wealth", "mean"),
+            mean_gross_terminal_wealth=("gross_terminal_wealth", "mean"),
+            mean_cumulative_tc=("cumulative_tc", "mean"),
+            mean_gross_minus_net_gap=("gross_minus_net_gap", "mean"),
+            mean_num_trades=("num_trades", "mean"),
+            mean_band_width=("mean_band_width", "mean"),
         )
     )
     summary.to_csv(outdir / "eval_summary.csv", index=False)
+    # Per-path (episode-level) raw results, one row per (method, path_id).
     df.to_csv(outdir / "eval_terminal_by_path.csv", index=False)
 
     fig = plt.figure(figsize=(8, 6))
