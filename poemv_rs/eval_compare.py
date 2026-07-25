@@ -68,7 +68,7 @@ def load_run_config(run_dir: Path) -> Dict:
 
 
 def load_checkpoint(ckpt_path: Path, device: str = "cpu") -> Dict:
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     if not isinstance(ckpt, dict):
         raise ValueError("Checkpoint must be a dict with vf/pi/omega fields.")
     return ckpt

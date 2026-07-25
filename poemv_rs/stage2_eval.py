@@ -148,7 +148,7 @@ def _plot_diagnostic_path(
         plt.close(fig)
 
 def _load_stage2_model(path: str, device: str):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     model_cfg = Stage2DNNConfig(**ckpt["model_cfg"])
     state = ckpt["model_state_dict"]
     # Detect model type from state_dict keys.
