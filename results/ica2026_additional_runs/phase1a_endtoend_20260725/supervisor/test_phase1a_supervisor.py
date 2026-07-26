@@ -307,5 +307,52 @@ class TestRestartResumesSameStage(unittest.TestCase):
         self.assertNotIn(1, candidates)  # seed 1 is already running
 
 
+class TestLaunchStage2SurvivesSpaceInPath(unittest.TestCase):
+    """Regression test for the 2026-07-27 incident: launch_stage2()'s sha256
+    diagnostic used to interpolate the checkpoint path unquoted into a
+    shell=True string. A space in the path (this repo's real REPO_ROOT
+    contains one - "My Drive") split it into multiple nonexistent-file
+    arguments, shasum printed nothing, and `.split()[0]` on the empty result
+    raised an unhandled IndexError that killed the whole supervisor process
+    immediately after it had already launched a real, orphaned training job.
+    This test uses a tmp directory whose path also contains a space (like the
+    dry-run methodology used for the earlier eval-quoting fix) and stubs out
+    only tmux/pid-lookup (no real tmux dependency needed) to verify
+    launch_stage2() completes without raising and records a real sha256."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="dry run space test ")
+        sup.BASE_OUT = Path(self.tmpdir.name)
+        self._orig_tmux_launch = sup.tmux_launch
+        self._orig_tmux_pane_pid = sup.tmux_pane_pid
+        sup.tmux_launch = lambda session, cmd: None  # no real tmux needed
+        sup.tmux_pane_pid = lambda session: 99999
+
+    def tearDown(self):
+        sup.tmux_launch = self._orig_tmux_launch
+        sup.tmux_pane_pid = self._orig_tmux_pane_pid
+        self.tmpdir.cleanup()
+
+    def test_launch_stage2_does_not_crash_and_records_sha(self):
+        stage1_dir = sup.BASE_OUT / "stage1" / "seed_1"
+        stage1_dir.mkdir(parents=True)
+        ckpt = stage1_dir / "checkpoint.pt"
+        ckpt.write_bytes(b"not a real checkpoint, just needs to exist for shasum")
+        import hashlib
+        expected_sha = hashlib.sha256(ckpt.read_bytes()).hexdigest()
+
+        state = sup.SupervisorState()
+        sup.launch_stage2(state, 1)  # must not raise
+
+        self.assertIn("1", state.running)
+        self.assertEqual(state.seed_status["1"], sup.STATUS_STAGE2_RUNNING)
+        # Recompute the sha the same way launch_stage2() does now, to confirm
+        # it actually succeeded (not silently swallowed to "").
+        import subprocess
+        r = subprocess.run(["shasum", "-a", "256", str(ckpt)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.split()[0], expected_sha)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -700,7 +700,27 @@ def launch_stage2(state: SupervisorState, seed: int) -> None:
     tmux_launch(session, cmd)
     time.sleep(3)
     pid = tmux_pane_pid(session)
-    sha = _run(f"shasum -a 256 {stage1_ckpt}").split()[0] if stage1_ckpt.exists() else ""
+    # Bug found 2026-07-27: this used to be `_run(f"shasum -a 256 {stage1_ckpt}")`,
+    # an unquoted path interpolated into a shell=True string - same class of bug
+    # as the eval-invocation quoting fix, just never triggered before because
+    # launch_stage2() had never actually been reached in this project's history
+    # until now. REPO_ROOT's space split the path into 3 nonexistent-file
+    # arguments, shasum printed nothing to stdout, and `.split()[0]` on that
+    # empty result raised an unhandled IndexError that killed the whole
+    # supervisor process moments after it had already launched the real
+    # training job (which kept running, orphaned, since it's an independent
+    # tmux session). Fixed by using an argv list (no shell at all - simpler
+    # than shlex-quoting for a single external command), and made failure
+    # non-fatal: the sha is a diagnostic nicety for the log/manifest, never
+    # worth crashing the supervisor over.
+    sha = ""
+    if stage1_ckpt.exists():
+        r = subprocess.run(["shasum", "-a", "256", str(stage1_ckpt)],
+                            capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            sha = r.stdout.split()[0]
+        else:
+            log(f"WARNING: could not compute sha256 for {stage1_ckpt}: {r.stderr.strip()}")
     job = JobState(seed=seed, stage="stage2", session=session, pid=pid,
                     start_time=now_iso(), output_dir=str(outdir), cmd=cmd)
     state.running[str(seed)] = asdict(job)
@@ -993,29 +1013,50 @@ def main() -> None:
         f"completed={state.completed} failed={list(state.failed.keys())} "
         f"global_halt={state.global_halt}")
     while True:
-        tracked_pids = [JobState(**d).pid for d in state.running.values() if JobState(**d).pid]
-        resources = sample_resources([p for p in tracked_pids if p])
-        state.resource_history.append(resources)
-        state.resource_history = state.resource_history[-200:]
-        log(f"resources: pressure={resources.get('pressure_level')} "
-            f"avail_gb={resources.get('avail_gb')} swap_mb={resources.get('swap_used_mb')} "
-            f"load1={resources.get('load1')} disk_free_gb={resources.get('disk_free_gb')} "
-            f"tracked_rss_mb={resources.get('tracked_rss_mb')} pageouts={resources.get('pageouts')} "
-            f"running={list(state.running.keys())} seed_status={state.seed_status} "
-            f"completed={state.completed} failed={list(state.failed.keys())}")
+        # 2026-07-27 incident: an unhandled exception inside one iteration (a
+        # latent unquoted-path bug in launch_stage2(), since fixed) killed the
+        # ENTIRE supervisor process right after it had already launched a real
+        # training job - the job kept running, orphaned, with no supervisor
+        # left to monitor it, and state.json never got to record it. For a
+        # process meant to run unattended for many hours across many seeds,
+        # one bug should degrade to "skip this cycle" - not "silently stop
+        # monitoring everything forever." Anything already running is
+        # completely unaffected by this try/except (their tmux sessions are
+        # independent processes); this only protects the supervisor's own
+        # bookkeeping loop.
+        try:
+            tracked_pids = [JobState(**d).pid for d in state.running.values() if JobState(**d).pid]
+            resources = sample_resources([p for p in tracked_pids if p])
+            state.resource_history.append(resources)
+            state.resource_history = state.resource_history[-200:]
+            log(f"resources: pressure={resources.get('pressure_level')} "
+                f"avail_gb={resources.get('avail_gb')} swap_mb={resources.get('swap_used_mb')} "
+                f"load1={resources.get('load1')} disk_free_gb={resources.get('disk_free_gb')} "
+                f"tracked_rss_mb={resources.get('tracked_rss_mb')} pageouts={resources.get('pageouts')} "
+                f"running={list(state.running.keys())} seed_status={state.seed_status} "
+                f"completed={state.completed} failed={list(state.failed.keys())}")
 
-        reconcile(state)
-        check_degrade(state, resources)
-        maybe_launch_next(state, resources)
+            reconcile(state)
+            check_degrade(state, resources)
+            maybe_launch_next(state, resources)
 
-        # `pending` is derived, kept only for backward-compatible observability and
-        # the "all done" check below - seed_status is the authoritative field that
-        # actually drives what gets launched (see maybe_launch_next()).
-        state.pending = [s for s in (1, 2, 3, 4)
-                         if state.seed_status.get(str(s)) not in (STATUS_COMPLETED, STATUS_FAILED)
-                         and str(s) not in state.running]
+            # `pending` is derived, kept only for backward-compatible observability
+            # and the "all done" check below - seed_status is the authoritative
+            # field that actually drives what gets launched (see maybe_launch_next()).
+            state.pending = [s for s in (1, 2, 3, 4)
+                             if state.seed_status.get(str(s)) not in (STATUS_COMPLETED, STATUS_FAILED)
+                             and str(s) not in state.running]
 
-        save_state(state)
+            save_state(state)
+        except Exception:
+            import traceback
+            log(f"UNEXPECTED ERROR in main loop iteration - skipping to next cycle "
+                f"(any already-running jobs are unaffected):\n{traceback.format_exc()}")
+            try:
+                save_state(state)
+            except Exception:
+                log("WARNING: save_state() also failed after the above error - "
+                    "state.json may be stale until the next successful cycle.")
 
         if not state.pending and not state.running:
             log("All seeds resolved (completed or failed). Supervisor exiting.")
