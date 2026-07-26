@@ -323,6 +323,15 @@ class TestLaunchStage2SurvivesSpaceInPath(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory(prefix="dry run space test ")
         sup.BASE_OUT = Path(self.tmpdir.name)
+        # Isolate log/manifest writes too - log()/manifest_row() write to the
+        # module-global LOG_PATH/MANIFEST_PATH, not anything derived from
+        # BASE_OUT, so without this a test run pollutes the REAL production
+        # supervisor.log/run_manifest.csv (this bit us once - see git history).
+        sup.SUP_DIR = sup.BASE_OUT / "supervisor"
+        sup.SUP_DIR.mkdir(parents=True)
+        sup.LOG_PATH = sup.SUP_DIR / "supervisor.log"
+        sup.MANIFEST_PATH = sup.BASE_OUT / "manifest" / "run_manifest.csv"
+        (sup.BASE_OUT / "manifest").mkdir(parents=True)
         self._orig_tmux_launch = sup.tmux_launch
         self._orig_tmux_pane_pid = sup.tmux_pane_pid
         sup.tmux_launch = lambda session, cmd: None  # no real tmux needed
