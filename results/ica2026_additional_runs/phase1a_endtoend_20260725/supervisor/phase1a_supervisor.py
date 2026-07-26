@@ -580,17 +580,25 @@ def run_eval_stage1(seed: int) -> tuple[bool, str]:
     stage1_dir = BASE_OUT / "stage1" / f"seed_{seed}"
     outdir = BASE_OUT / "eval_stage1" / f"seed_{seed}"
     outdir.mkdir(parents=True, exist_ok=True)
-    cmd = (
-        f"{CONDA_ACTIVATE} && cd '{REPO_ROOT}' && python -m poemv_rs.eval_compare "
-        f"--checkpoint {stage1_dir}/checkpoint.pt --run_dir {stage1_dir} "
-        f"--n_paths {EVAL_N_PATHS} --seed {EVAL_SEED} --filter_mode estimated_params "
+    # Bug (found 2026-07-26/27): paths used to be interpolated unquoted into this
+    # shell=True string. REPO_ROOT contains a space ("My Drive"), so the shell
+    # split it into two argv tokens and eval_compare.py died with "unrecognized
+    # arguments". Fixed the same way Bug B was: build argv as a list and only
+    # ever quote once, via shlex.join() (see build_stage1_cmd() above).
+    argv = [
+        "python", "-m", "poemv_rs.eval_compare",
+        "--checkpoint", str(stage1_dir / "checkpoint.pt"), "--run_dir", str(stage1_dir),
+        "--n_paths", str(EVAL_N_PATHS), "--seed", str(EVAL_SEED), "--filter_mode", "estimated_params",
         # eval_compare.py's --T/--a_max defaults are 10.0/2.0 (paper's original 10y-horizon
         # demo), which do NOT match this project's 1-year/a_max=1.0 baseline training config.
         # Discovered the hard way during the seed-0 pilot (an eval silently ran with a 10x
         # longer horizon than the model was trained on) - must always override explicitly.
-        f"--T 1.0 --dt 0.003968253968253968 --a_max 1.0 --z 1.2 --x0 1.0 --p0 0.5 --r 0.01 "
-        f"--outdir {outdir}"
-    )
+        "--T", "1.0", "--dt", "0.003968253968253968", "--a_max", "1.0", "--z", "1.2",
+        "--x0", "1.0", "--p0", "0.5", "--r", "0.01",
+        "--outdir", str(outdir),
+    ]
+    quoted = shlex.join(argv)
+    cmd = f"{CONDA_ACTIVATE} && cd {shlex.quote(str(REPO_ROOT))} && {quoted}"
     log(f"Running Stage1 eval for seed {seed} (blocking)...")
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True, executable="/bin/zsh")
     if r.returncode != 0:
@@ -614,13 +622,19 @@ def run_eval_stage2(seed: int) -> tuple[bool, str]:
     stage2_ckpt = stage2_dir / "best_checkpoint.pt"
     if not stage2_ckpt.exists():
         stage2_ckpt = stage2_dir / "checkpoint.pt"
-    cmd = (
-        f"{CONDA_ACTIVATE} && cd '{REPO_ROOT}' && python -m poemv_rs.stage2_eval "
-        f"--stage1_run_dir {stage1_dir} --stage1_checkpoint {stage1_dir}/checkpoint.pt "
-        f"--stage2_checkpoint {stage2_ckpt} --outdir {outdir} "
-        f"--n_paths {EVAL_N_PATHS} --seed {EVAL_SEED} --T 1.0 --dt 0.003968253968253968 --z 1.2 "
-        f"--x0 1.0 --tcost 0.002 --monthly_steps 21 --lev_cap 1.5 --filter_mode estimated_params"
-    )
+    # Same unquoted-path bug as run_eval_stage1() (see comment there); fixed
+    # the same way, via argv list + shlex.join().
+    argv = [
+        "python", "-m", "poemv_rs.stage2_eval",
+        "--stage1_run_dir", str(stage1_dir), "--stage1_checkpoint", str(stage1_dir / "checkpoint.pt"),
+        "--stage2_checkpoint", str(stage2_ckpt), "--outdir", str(outdir),
+        "--n_paths", str(EVAL_N_PATHS), "--seed", str(EVAL_SEED), "--T", "1.0",
+        "--dt", "0.003968253968253968", "--z", "1.2",
+        "--x0", "1.0", "--tcost", "0.002", "--monthly_steps", "21", "--lev_cap", "1.5",
+        "--filter_mode", "estimated_params",
+    ]
+    quoted = shlex.join(argv)
+    cmd = f"{CONDA_ACTIVATE} && cd {shlex.quote(str(REPO_ROOT))} && {quoted}"
     log(f"Running Stage2 eval for seed {seed} (blocking)...")
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True, executable="/bin/zsh")
     if r.returncode != 0:
