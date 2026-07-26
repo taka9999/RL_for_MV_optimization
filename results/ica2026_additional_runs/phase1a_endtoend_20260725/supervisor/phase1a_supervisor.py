@@ -62,6 +62,21 @@ STALE_METRICS_MIN = 20  # a running job whose metrics.csv hasn't updated in this
 STAGE1_TOTAL_ITERS = 9000
 STAGE2_TOTAL_ITERS = 800
 
+# Per-seed fine-grained status, persisted in SupervisorState.seed_status (keyed by
+# str(seed)). Added because the coarse pending/running/completed/failed lists
+# cannot distinguish "Stage 1 done, Stage 2 not started" from "not started at
+# all" - a seed manually taken out of `pending` after a one-off out-of-band
+# fix (e.g. seed 1/2's Stage 1 eval, re-run after the quoting-bug fix) had no
+# home in the old schema and would never be picked up again after a restart.
+STATUS_STAGE1_PENDING = "stage1_pending"
+STATUS_STAGE1_RUNNING = "stage1_running"
+STATUS_STAGE1_EVAL_PENDING = "stage1_complete_eval_pending"
+STATUS_STAGE2_PENDING = "stage2_pending"
+STATUS_STAGE2_RUNNING = "stage2_running"
+STATUS_STAGE2_EVAL_PENDING = "stage2_complete_eval_pending"
+STATUS_COMPLETED = "completed"
+STATUS_FAILED = "failed"
+
 # Argument lists (NOT pre-joined strings) - built into a shell-safe command via
 # shlex.join()/shlex.quote() in build_stage1_cmd/build_stage2_cmd below. This is
 # Bug B's fix: the previous version embedded literal double-quotes around the
@@ -319,6 +334,7 @@ class JobState:
     start_time: str
     output_dir: str
     resume_attempted: bool = False
+    cmd: str = ""  # exact launch command, retained for failure records (item 6)
 
 
 @dataclass
@@ -326,11 +342,16 @@ class SupervisorState:
     pending: list[int] = field(default_factory=lambda: [1, 2, 3, 4])
     running: dict = field(default_factory=dict)   # seed(str) -> JobState dict
     completed: list[int] = field(default_factory=list)
-    failed: dict = field(default_factory=dict)    # seed(str) -> reason
+    failed: dict = field(default_factory=dict)    # seed(str) -> failure record dict
     failure_causes: list[str] = field(default_factory=list)
     resource_history: list[dict] = field(default_factory=list)
     global_halt: bool = False
     halt_reason: str = ""
+    # seed(str) -> one of STATUS_* above. Authoritative source for "what does
+    # this seed need to do next" - pending/running/completed/failed above are
+    # kept in sync for backward-compatible observability (e.g. the "all done"
+    # check in main()) but are no longer read to decide what to launch.
+    seed_status: dict = field(default_factory=dict)
 
 
 SEED0_STAGE2_SESSION = "ica_phase1_stage2_seed0"
@@ -339,7 +360,12 @@ SEED0_STAGE2_SESSION = "ica_phase1_stage2_seed0"
 def load_state() -> SupervisorState:
     if STATE_PATH.exists():
         d = json.loads(STATE_PATH.read_text())
-        return SupervisorState(**d)
+        s = SupervisorState(**d)
+        if migrate_seed_status(s):
+            log("seed_status backfilled/repaired from disk evidence on load: "
+                f"{s.seed_status}")
+            save_state(s)
+        return s
     s = SupervisorState()
     # Seed 0's Stage 1 + Stage 1 eval already completed and passed gate (done by the
     # coordinator before this supervisor was ever started). Seed 0's Stage 2 training is
@@ -361,11 +387,81 @@ def load_state() -> SupervisorState:
         log("WARNING: seed-0 Stage2 tmux session not found at supervisor startup - "
             "assuming seed 0 already finished and was handled elsewhere. Proceeding "
             "directly to seeds 1-4.")
+        s.seed_status["0"] = STATUS_COMPLETED
+    for seed in (1, 2, 3, 4):
+        s.seed_status[str(seed)] = STATUS_STAGE1_PENDING
+    if "0" in s.running:
+        s.seed_status["0"] = STATUS_STAGE2_RUNNING
     return s
 
 
 def save_state(s: SupervisorState) -> None:
     STATE_PATH.write_text(json.dumps(asdict(s), indent=2))
+
+
+def set_seed_status(state: "SupervisorState", seed: int, status: str) -> None:
+    prev = state.seed_status.get(str(seed))
+    state.seed_status[str(seed)] = status
+    if prev != status:
+        log(f"seed {seed} status: {prev} -> {status}")
+
+
+def infer_seed_status_from_disk(seed: int) -> str:
+    """Best-effort reconstruction of a seed's pipeline position purely from
+    on-disk artifacts, used only to backfill/repair seed_status for a seed
+    that isn't in `running`/`completed`/`failed` (i.e. was in `pending`, or -
+    as happened for seed 1/2 after their Stage 1 eval was fixed and re-run
+    out of band - was manually parked outside all four coarse lists)."""
+    stage1_dir = BASE_OUT / "stage1" / f"seed_{seed}"
+    ok1, _ = stage1_training_complete(stage1_dir)
+    if not ok1:
+        return STATUS_STAGE1_PENDING
+    eval1_dir = None
+    for candidate in (BASE_OUT / "eval_stage1_postfix" / f"seed_{seed}",
+                      BASE_OUT / "eval_stage1" / f"seed_{seed}"):
+        if (candidate / "eval_summary.csv").exists():
+            eval1_dir = candidate
+            break
+    if eval1_dir is None:
+        return STATUS_STAGE1_EVAL_PENDING
+    stage2_dir = BASE_OUT / "stage2" / f"seed_{seed}"
+    ok2, _ = stage2_training_complete(stage2_dir)
+    if not ok2:
+        return STATUS_STAGE2_PENDING
+    eval2_dir = BASE_OUT / "eval_stage2" / f"seed_{seed}"
+    if not (eval2_dir / "eval_summary.csv").exists():
+        return STATUS_STAGE2_EVAL_PENDING
+    return STATUS_COMPLETED
+
+
+def migrate_seed_status(state: "SupervisorState") -> bool:
+    """Backfill/repair state.seed_status for state.json files written before
+    seed_status existed, or where a seed was left out of pending/running/
+    completed/failed entirely. Idempotent - safe to call on every load; only
+    touches entries that disagree with what the coarse fields + disk say."""
+    changed = False
+    for seed in (0, 1, 2, 3, 4):
+        seed_str = str(seed)
+        if seed in state.completed:
+            want = STATUS_COMPLETED
+        elif seed_str in state.failed:
+            want = STATUS_FAILED
+        elif seed_str in state.running:
+            job = JobState(**state.running[seed_str])
+            want = STATUS_STAGE1_RUNNING if job.stage == "stage1" else STATUS_STAGE2_RUNNING
+        elif seed == 0:
+            # Seed 0 is never in pending/running/completed/failed once its
+            # Stage2 tmux session has ended and reconcile() marked it
+            # completed via state.completed - if we get here it predates
+            # this script's involvement entirely; leave unset rather than
+            # guessing (this script never manages seed 0's Stage 1).
+            continue
+        else:
+            want = infer_seed_status_from_disk(seed)
+        if state.seed_status.get(seed_str) != want:
+            state.seed_status[seed_str] = want
+            changed = True
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -510,23 +606,60 @@ def check_gross_net_invariant(csv_path: Path) -> tuple[bool, str]:
     return True, f"invariant holds, max abs diff={maxdiff:.2e}"
 
 
-def record_failure(state: SupervisorState, seed: int, cause: str, detail: str) -> None:
-    """Bug C fix: dedupe by (seed, cause) - `state.failed` is keyed by seed, so a
-    given seed can only ever contribute ONE entry no matter how many times this
-    is called for it (e.g. if reconcile() somehow saw it twice in one cycle).
-    The same-cause count used for global_halt is derived from DISTINCT SEEDS in
-    `state.failed` matching `cause`, not from an ever-growing append-only list -
-    this is what "2+ RUNS failing with the same cause" should mean, and it can
-    no longer inflate from a single seed's dead job being reprocessed repeatedly
-    (that reprocessing bug is separately fixed in reconcile())."""
-    already_recorded = state.failed.get(str(seed), "").startswith(cause + ":")
-    state.failed[str(seed)] = f"{cause}: {detail}"
+def record_failure(state: SupervisorState, seed: int, stage: str, cause: str, detail: str,
+                    output_dir: str | None = None, cmd: str | None = None,
+                    resumable: bool = False) -> None:
+    """Bug C fix: dedupe by (seed, stage, cause) - `state.failed` is keyed by
+    seed, so a given seed can only ever contribute ONE entry no matter how many
+    times this is called for it (e.g. if reconcile() somehow saw it twice in
+    one cycle). The same-cause count used for global_halt is derived from
+    DISTINCT SEEDS in `state.failed` matching `cause`, not from an
+    ever-growing append-only list - this is what "2+ RUNS failing with the
+    same cause" should mean, and it can no longer inflate from a single
+    seed's dead job being reprocessed repeatedly (that reprocessing bug is
+    separately fixed in reconcile()).
+
+    Item 6 requirement: persist seed, stage, failure type, latest checkpoint,
+    exact command, log tail, and resumability for every failure - not just a
+    cause string."""
+    key = str(seed)
+    prev = state.failed.get(key)
+    already_recorded = isinstance(prev, dict) and prev.get("stage") == stage and prev.get("failure_type") == cause
+
+    latest_checkpoint = None
+    log_tail = None
+    if output_dir is not None:
+        od = Path(output_dir)
+        if od.exists():
+            ckpts = sorted(od.glob("checkpoint*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if ckpts:
+                latest_checkpoint = str(ckpts[0])
+            logf = od / "stdout.log"
+            if logf.exists():
+                try:
+                    log_tail = "\n".join(logf.read_text(errors="replace").splitlines()[-50:])
+                except OSError:
+                    pass
+
+    state.failed[key] = {
+        "seed": seed,
+        "stage": stage,
+        "failure_type": cause,
+        "detail": detail,
+        "latest_checkpoint": latest_checkpoint,
+        "exact_command": cmd,
+        "log_tail": log_tail,
+        "resumable": resumable,
+        "timestamp": now_iso(),
+    }
+    set_seed_status(state, seed, STATUS_FAILED)
     if not already_recorded:
         state.failure_causes.append(cause)
-        manifest_row(timestamp=now_iso(), seed=seed, stage="?", status="failed", note=f"{cause}: {detail}")
-    log(f"SEED {seed} FAILED [{cause}]: {detail}" + (" (duplicate re-record, not re-counted)"
-                                                       if already_recorded else ""))
-    same_cause_seeds = sum(1 for v in state.failed.values() if v.startswith(cause + ":"))
+        manifest_row(timestamp=now_iso(), seed=seed, stage=stage, status="failed", note=f"{cause}: {detail}")
+    log(f"SEED {seed} FAILED [{stage}/{cause}]: {detail}" + (" (duplicate re-record, not re-counted)"
+                                                              if already_recorded else ""))
+    same_cause_seeds = sum(1 for v in state.failed.values()
+                           if isinstance(v, dict) and v.get("failure_type") == cause)
     if same_cause_seeds >= 2 and not state.global_halt:
         state.global_halt = True
         state.halt_reason = f"2+ distinct seeds failed with the same cause: {cause}"
@@ -547,8 +680,10 @@ def launch_stage1(state: SupervisorState, seed: int, resume: bool = False) -> No
     time.sleep(3)
     pid = tmux_pane_pid(session)
     job = JobState(seed=seed, stage="stage1", session=session, pid=pid,
-                    start_time=now_iso(), output_dir=str(outdir), resume_attempted=resume)
+                    start_time=now_iso(), output_dir=str(outdir), resume_attempted=resume,
+                    cmd=cmd)
     state.running[str(seed)] = asdict(job)
+    set_seed_status(state, seed, STATUS_STAGE1_RUNNING)
     log(f"Launched seed {seed} Stage1 (resume={resume}) session={session} pid={pid}")
     manifest_row(timestamp=now_iso(), seed=seed, stage="stage1", tmux_session=session,
                  pid=pid, command=cmd, start_time=job.start_time, output_dir=str(outdir),
@@ -567,8 +702,9 @@ def launch_stage2(state: SupervisorState, seed: int) -> None:
     pid = tmux_pane_pid(session)
     sha = _run(f"shasum -a 256 {stage1_ckpt}").split()[0] if stage1_ckpt.exists() else ""
     job = JobState(seed=seed, stage="stage2", session=session, pid=pid,
-                    start_time=now_iso(), output_dir=str(outdir))
+                    start_time=now_iso(), output_dir=str(outdir), cmd=cmd)
     state.running[str(seed)] = asdict(job)
+    set_seed_status(state, seed, STATUS_STAGE2_RUNNING)
     log(f"Launched seed {seed} Stage2 session={session} pid={pid} "
         f"stage1_checkpoint={stage1_ckpt} sha256={sha}")
     manifest_row(timestamp=now_iso(), seed=seed, stage="stage2", tmux_session=session,
@@ -576,7 +712,9 @@ def launch_stage2(state: SupervisorState, seed: int) -> None:
                  status="started", note=f"stage1_ckpt_sha256={sha}")
 
 
-def run_eval_stage1(seed: int) -> tuple[bool, str]:
+def run_eval_stage1(seed: int) -> tuple[bool, str, str]:
+    """Returns (ok, msg, exact_command) - the command is always returned, even
+    on failure, so record_failure() can persist it (item 6 requirement)."""
     stage1_dir = BASE_OUT / "stage1" / f"seed_{seed}"
     outdir = BASE_OUT / "eval_stage1" / f"seed_{seed}"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -602,7 +740,7 @@ def run_eval_stage1(seed: int) -> tuple[bool, str]:
     log(f"Running Stage1 eval for seed {seed} (blocking)...")
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True, executable="/bin/zsh")
     if r.returncode != 0:
-        return False, f"eval_compare.py exited {r.returncode}: {r.stderr[-500:]}"
+        return False, f"eval_compare.py exited {r.returncode}: {r.stderr[-500:]}", cmd
     manifest_row(timestamp=now_iso(), seed=seed, stage="eval_stage1", command=cmd,
                  output_dir=str(outdir), status="done")
     csvs = list(outdir.glob("*.csv"))
@@ -610,11 +748,12 @@ def run_eval_stage1(seed: int) -> tuple[bool, str]:
         ok, msg = check_eval_csv_sane(c, [col for col in
                                            ["terminal_wealth", "xT", "XT"] ])
         if not ok:
-            return False, f"{c.name}: {msg}"
-    return True, "ok"
+            return False, f"{c.name}: {msg}", cmd
+    return True, "ok", cmd
 
 
-def run_eval_stage2(seed: int) -> tuple[bool, str]:
+def run_eval_stage2(seed: int) -> tuple[bool, str, str]:
+    """Returns (ok, msg, exact_command) - see run_eval_stage1()."""
     stage1_dir = BASE_OUT / "stage1" / f"seed_{seed}"
     stage2_dir = BASE_OUT / "stage2" / f"seed_{seed}"
     outdir = BASE_OUT / "eval_stage2" / f"seed_{seed}"
@@ -638,15 +777,15 @@ def run_eval_stage2(seed: int) -> tuple[bool, str]:
     log(f"Running Stage2 eval for seed {seed} (blocking)...")
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True, executable="/bin/zsh")
     if r.returncode != 0:
-        return False, f"stage2_eval.py exited {r.returncode}: {r.stderr[-500:]}"
+        return False, f"stage2_eval.py exited {r.returncode}: {r.stderr[-500:]}", cmd
     manifest_row(timestamp=now_iso(), seed=seed, stage="eval_stage2", command=cmd,
                  output_dir=str(outdir), status="done")
     csvs = list(outdir.glob("*.csv"))
     for c in csvs:
         ok, msg = check_gross_net_invariant(c)
         if not ok:
-            return False, f"{c.name}: {msg}"
-    return True, "ok"
+            return False, f"{c.name}: {msg}", cmd
+    return True, "ok", cmd
 
 
 # ---------------------------------------------------------------------------
@@ -683,12 +822,26 @@ def reconcile(state: SupervisorState) -> None:
                 log(f"Seed {seed} Stage1 completed cleanly. {msg}")
                 manifest_row(timestamp=now_iso(), seed=seed, stage="stage1",
                              output_dir=job.output_dir, status="completed")
-                eok, emsg = run_eval_stage1(seed)
+                # Persist "eval in progress" before the (possibly slow) blocking eval
+                # call, so a crash mid-eval leaves an honest status on disk instead of
+                # silently looking like it never got past stage1_running.
+                set_seed_status(state, seed, STATUS_STAGE1_EVAL_PENDING)
+                save_state(state)
+                eok, emsg, ecmd = run_eval_stage1(seed)
                 if not eok:
-                    record_failure(state, seed, "eval_stage1_anomaly", emsg)
+                    # Eval-only failure: the Stage1 checkpoint itself is fine and does
+                    # NOT need retraining - only the evaluation step needs a retry once
+                    # its cause is understood, so this is resumable=True.
+                    record_failure(state, seed, "stage1", "eval_stage1_anomaly", emsg,
+                                    output_dir=job.output_dir, cmd=ecmd, resumable=True)
                     continue
                 log(f"Seed {seed} Stage1 eval passed gate: {emsg}")
-                launch_stage2(state, seed)
+                set_seed_status(state, seed, STATUS_STAGE2_PENDING)
+                # Do NOT launch_stage2() inline here - let maybe_launch_next() (called
+                # right after reconcile() in the same main-loop cycle) decide, so the
+                # 2-job concurrency cap and the 15-min resource gate are always honored
+                # for every Stage2 launch, including one chained straight off a Stage1
+                # eval pass.
             else:
                 if not job.resume_attempted:
                     latest = outdir / "checkpoint_latest.pt"
@@ -697,30 +850,65 @@ def reconcile(state: SupervisorState) -> None:
                             f"from checkpoint_latest.pt")
                         launch_stage1(state, seed, resume=True)
                     else:
-                        record_failure(state, seed, "stage1_crash_no_checkpoint", msg)
+                        record_failure(state, seed, "stage1", "stage1_crash_no_checkpoint", msg,
+                                        output_dir=job.output_dir, cmd=job.cmd, resumable=False)
                 else:
-                    record_failure(state, seed, "stage1_crash_after_resume", msg)
+                    record_failure(state, seed, "stage1", "stage1_crash_after_resume", msg,
+                                    output_dir=job.output_dir, cmd=job.cmd, resumable=False)
         else:  # stage2
             ok, msg = stage2_training_complete(outdir)  # Bug A fix: stage-specific check
             if ok:
                 log(f"Seed {seed} Stage2 completed. {msg}")
                 manifest_row(timestamp=now_iso(), seed=seed, stage="stage2",
                              output_dir=job.output_dir, status="completed")
-                eok, emsg = run_eval_stage2(seed)
+                set_seed_status(state, seed, STATUS_STAGE2_EVAL_PENDING)
+                save_state(state)
+                eok, emsg, ecmd = run_eval_stage2(seed)
                 if not eok:
-                    record_failure(state, seed, "eval_stage2_anomaly", emsg)
+                    record_failure(state, seed, "stage2", "eval_stage2_anomaly", emsg,
+                                    output_dir=job.output_dir, cmd=ecmd, resumable=True)
                     continue
                 log(f"Seed {seed} Stage2 eval passed gate: {emsg}")
                 state.completed.append(seed)
+                set_seed_status(state, seed, STATUS_COMPLETED)
             else:
                 # Stage2 has no resume mechanism - single failure, no retry.
-                record_failure(state, seed, "stage2_crash_no_resume", msg)
+                record_failure(state, seed, "stage2", "stage2_crash_no_resume", msg,
+                                output_dir=job.output_dir, cmd=job.cmd, resumable=False)
+
+
+def _launch_next_stage_for(state: SupervisorState, seed: int) -> None:
+    status = state.seed_status.get(str(seed))
+    if status == STATUS_STAGE1_PENDING:
+        launch_stage1(state, seed)
+    elif status == STATUS_STAGE2_PENDING:
+        launch_stage2(state, seed)
+    else:
+        log(f"WARNING: _launch_next_stage_for(seed={seed}) called with unexpected "
+            f"status={status!r}; not launching anything.")
+
+
+def _launchable_candidates(state: SupervisorState) -> list[int]:
+    """Seed-status-driven candidate queue, replacing the old flat `pending` pop.
+    Wave gate: seeds 3/4 (a fresh full Stage1->Stage2 pipeline) may not start
+    until BOTH seed 1 and seed 2 (already past Stage1 before this orchestration
+    fix) have reached `completed`. If either 1 or 2 has `failed`, wave 2 stays
+    permanently blocked - a human must decide next steps - but this does NOT
+    touch whichever of 1/2 is still healthy and running."""
+    wave1 = (1, 2)
+    wave1_done = all(state.seed_status.get(str(s)) == STATUS_COMPLETED for s in wave1)
+    wave1_blocked = any(state.seed_status.get(str(s)) == STATUS_FAILED for s in wave1)
+
+    candidates = [s for s in wave1
+                  if state.seed_status.get(str(s)) in (STATUS_STAGE1_PENDING, STATUS_STAGE2_PENDING)]
+    if wave1_done and not wave1_blocked:
+        candidates += [s for s in (3, 4)
+                       if state.seed_status.get(str(s)) in (STATUS_STAGE1_PENDING, STATUS_STAGE2_PENDING)]
+    return [s for s in candidates if str(s) not in state.running]
 
 
 def maybe_launch_next(state: SupervisorState, resources: dict) -> None:
     if state.global_halt:
-        return
-    if not state.pending:
         return
     if "0" in state.running:
         # Hard precondition from the user: seed 0's FULL end-to-end pilot (Stage1+eval+
@@ -728,10 +916,12 @@ def maybe_launch_next(state: SupervisorState, resources: dict) -> None:
         # as a resource-permitting concurrent job. Do not start seeds 1-4 while seed 0 is
         # still running, regardless of how much headroom the resource check reports.
         return
+    candidates = _launchable_candidates(state)
+    if not candidates:
+        return
     n_running = len(state.running)
     if n_running == 0:
-        seed = state.pending.pop(0)
-        launch_stage1(state, seed)
+        _launch_next_stage_for(state, candidates[0])
         return
     if n_running >= 2:
         return
@@ -745,10 +935,10 @@ def maybe_launch_next(state: SupervisorState, resources: dict) -> None:
                 if not ok:
                     log("Not adding a 2nd job: an existing running job looks anomalous.")
                     return
-        seed = state.pending.pop(0)
+        seed = candidates[0]
         log(f"Resource gate passed (green for >= {MIN_GATE_WINDOW_S/60:.0f} min): "
             f"starting 2nd concurrent job for seed {seed}. Latest reading: {resources}")
-        launch_stage1(state, seed)
+        _launch_next_stage_for(state, seed)
     else:
         pass  # stay serial until sustained green
 
@@ -789,14 +979,17 @@ def check_degrade(state: SupervisorState, resources: dict) -> None:
             manifest_row(timestamp=now_iso(), seed=later.seed, stage="stage1",
                          status="paused_for_memory", note=f"stopped via {method} at iter {last_iter}")
             del state.running[str(later.seed)]
-            state.pending.insert(0, later.seed)  # put back at front of queue, not lost
+            # Revert to stage1_pending (not lost) - maybe_launch_next() will resume it
+            # from checkpoint_latest.pt via the normal Stage1 crash/resume path once
+            # relaunched, same as any other early stop.
+            set_seed_status(state, later.seed, STATUS_STAGE1_PENDING)
 
 
 def main() -> None:
     SUP_DIR.mkdir(parents=True, exist_ok=True)
     (BASE_OUT / "manifest").mkdir(parents=True, exist_ok=True)
     state = load_state()
-    log(f"Supervisor starting. pending={state.pending} running={list(state.running.keys())} "
+    log(f"Supervisor starting. seed_status={state.seed_status} running={list(state.running.keys())} "
         f"completed={state.completed} failed={list(state.failed.keys())} "
         f"global_halt={state.global_halt}")
     while True:
@@ -808,12 +1001,19 @@ def main() -> None:
             f"avail_gb={resources.get('avail_gb')} swap_mb={resources.get('swap_used_mb')} "
             f"load1={resources.get('load1')} disk_free_gb={resources.get('disk_free_gb')} "
             f"tracked_rss_mb={resources.get('tracked_rss_mb')} pageouts={resources.get('pageouts')} "
-            f"running={list(state.running.keys())} pending={state.pending} "
+            f"running={list(state.running.keys())} seed_status={state.seed_status} "
             f"completed={state.completed} failed={list(state.failed.keys())}")
 
         reconcile(state)
         check_degrade(state, resources)
         maybe_launch_next(state, resources)
+
+        # `pending` is derived, kept only for backward-compatible observability and
+        # the "all done" check below - seed_status is the authoritative field that
+        # actually drives what gets launched (see maybe_launch_next()).
+        state.pending = [s for s in (1, 2, 3, 4)
+                         if state.seed_status.get(str(s)) not in (STATUS_COMPLETED, STATUS_FAILED)
+                         and str(s) not in state.running]
 
         save_state(state)
 
