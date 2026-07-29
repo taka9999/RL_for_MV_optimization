@@ -64,6 +64,15 @@ STAGE1_EXCLUSION_REASON = (
 )
 STAGE2_EVAL_REL = {s: f"eval_stage2/seed_{s}" for s in SEEDS}
 STAGE2_METHODS = ["Center+DNNBand", "CenterOnly_Daily", "CenterOnly_Monthly", "EW_Monthly"]
+# Short labels for figure readability only (item 9) - full names remain in all CSVs/tables.
+STAGE2_METHOD_SHORT = {
+    "Center+DNNBand": "Center+DNNBand",
+    "CenterOnly_Daily": "Center-Daily",
+    "CenterOnly_Monthly": "Center-Monthly",
+    "EW_Monthly": "EW-Monthly",
+}
+STAGE1_METHOD_SHORT = {"RL": "HJB-guided RL", "EW": "Equal weight", "MinVar": "Min variance"}
+POSITIVITY_FLOOR = 1e-10  # matches _utility_torch's eps in poemv_rs/stage2_direct_boundary.py
 STAGE2_DAILY_METHODS = {"Center+DNNBand", "CenterOnly_Daily"}  # dwell-fraction only meaningful here
 STAGE1_METHODS = ["RL", "EW", "MinVar"]
 
@@ -466,6 +475,39 @@ def train_diagnostics(base: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def utility_consistent_metrics(base: Path) -> pd.DataFrame:
+    """Mean terminal utility / log-utility certainty equivalent, reconstructed
+    from already-computed episode-level net_terminal_wealth (Stage 2) and
+    terminal_wealth (Stage 1, RL) using the exact positivity floor from the
+    training implementation (poemv_rs/stage2_direct_boundary.py _utility_torch,
+    eps=1e-10) and log utility (the utility_kind actually used for Phase 1A).
+    No re-simulation - purely a derived statistic over existing episode-level
+    data (item 7)."""
+    rows = []
+    for s in SEEDS:
+        df1 = pd.read_csv(base / STAGE1_EVAL_REL[s] / "eval_terminal_by_path.csv")
+        sub1 = df1[df1["method"] == "RL"]
+        tw1 = sub1["terminal_wealth"].to_numpy()
+        u1 = np.log(np.maximum(tw1, POSITIVITY_FLOOR))
+        rows.append({
+            "stage": "stage1", "seed": s, "method": "RL", "n_eval_paths": len(tw1),
+            "mean_terminal_utility": float(np.mean(u1)),
+            "log_utility_certainty_equivalent": float(np.exp(np.mean(u1))),
+        })
+
+        df2 = pd.read_csv(base / STAGE2_EVAL_REL[s] / "eval_terminal_by_path.csv")
+        for m in STAGE2_METHODS:
+            sub2 = df2[df2["method"] == m]
+            tw2 = sub2["net_terminal_wealth"].to_numpy()
+            u2 = np.log(np.maximum(tw2, POSITIVITY_FLOOR))
+            rows.append({
+                "stage": "stage2", "seed": s, "method": m, "n_eval_paths": len(tw2),
+                "mean_terminal_utility": float(np.mean(u2)),
+                "log_utility_certainty_equivalent": float(np.exp(np.mean(u2))),
+            })
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------------------
 # Section 2 (second stage): cross-seed statistics
 # ---------------------------------------------------------------------------
@@ -478,6 +520,7 @@ METRIC_COLS = [
     "avg_trade_size_proxy", "mean_band_width", "lower_boundary_avg", "upper_boundary_avg",
     "no_trade_dwell_fraction", "mean_avg_gross_leverage", "mean_avg_cash_weight",
     "share_paths_avg_leverage_near_cap", "runtime_seconds",
+    "mean_terminal_utility", "log_utility_certainty_equivalent",
 ]
 
 
@@ -747,6 +790,50 @@ def make_table3(paired: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
     return df
 
 
+# Item 8: full 5-seed intervals for metrics not already fully tabulated in
+# Tables 1-2 (which report only mean_terminal_wealth/net_terminal_wealth
+# intervals in the main text). One row per (stage, method); columns are
+# "<metric> [ci_low, ci_high]" strings for compact display, plus the raw
+# numeric columns for reproducibility.
+FULL_INTERVAL_METRICS = [
+    "target_achievement_probability", "target_msd", "mean_shortfall_vs_target",
+    "mean_cumulative_tc", "mean_turnover", "mean_num_trades", "mean_band_width",
+    "mean_terminal_utility", "log_utility_certainty_equivalent",
+]
+
+
+def make_table4_full_intervals(agg: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
+    rows = []
+    combos = [("stage1", m) for m in STAGE1_METHODS] + [("stage2", m) for m in STAGE2_METHODS]
+    for stage, method in combos:
+        row = {"stage": stage, "method": method}
+        for metric in FULL_INTERVAL_METRICS:
+            r = pick(agg, stage, method, metric)
+            row[f"{metric}_mean"] = r["mean"]
+            row[f"{metric}_ci95_low"] = r["ci95_low"]
+            row[f"{metric}_ci95_high"] = r["ci95_high"]
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    df.to_csv(out_dir / "tables" / "table4_full_metric_intervals.csv", index=False)
+
+    # Compact display version for the LaTeX appendix: "mean [lo, hi]" strings.
+    disp_rows = []
+    for stage, method in combos:
+        r = {"Stage": "1" if stage == "stage1" else "2", "Method": method}
+        for metric in FULL_INTERVAL_METRICS:
+            m = pick(agg, stage, method, metric)
+            if not np.isfinite(m["mean"]):
+                r[metric] = "--"
+            elif not np.isfinite(m["ci95_low"]):
+                r[metric] = f"{m['mean']:.4g} (seed-invariant)"
+            else:
+                r[metric] = f"{m['mean']:.4g} [{m['ci95_low']:.4g}, {m['ci95_high']:.4g}]"
+        disp_rows.append(r)
+    disp_df = pd.DataFrame(disp_rows)
+    disp_df.to_latex(out_dir / "tables" / "table4_full_metric_intervals.tex", index=False)
+    return df
+
+
 # ---------------------------------------------------------------------------
 # ICA report figures
 # ---------------------------------------------------------------------------
@@ -770,7 +857,8 @@ def fig1_mean_vs_std(seed_level: pd.DataFrame, agg: pd.DataFrame, out_dir: Path)
         xerr = (mx["mean"] - mx["ci95_low"]) if np.isfinite(mx["ci95_low"]) else 0
         yerr = (my["mean"] - my["ci95_low"]) if np.isfinite(my["ci95_low"]) else 0
         ax.errorbar([mx["mean"]], [my["mean"]], xerr=[[xerr], [xerr]], yerr=[[yerr], [yerr]],
-                   fmt="D", color="tab:red", capsize=4, label="5-seed mean\n(95% CI, training-seed uncertainty)", zorder=4)
+                   fmt="D", color="tab:red", capsize=4,
+                   label="5-seed mean\n(95% Student-$t$ training-seed interval)", zorder=4)
         ax.set_xlabel("Mean terminal wealth")
         ax.set_ylabel("Terminal wealth std (within-seed, evaluation-path risk)")
         ax.set_title(title)
@@ -789,19 +877,26 @@ def fig2_terminal_wealth_distribution(combined: pd.DataFrame, out_dir: Path):
     s1 = combined[combined.stage == "stage1"]
     data1 = [s1[s1.method == m]["terminal_wealth"].to_numpy() for m in STAGE1_METHODS]
     axes[0].violinplot(data1, showmeans=True, showextrema=False)
-    axes[0].set_xticks(range(1, len(STAGE1_METHODS) + 1), STAGE1_METHODS)
+    axes[0].axhline(Z_TARGET, color="tab:red", linestyle="--", linewidth=1, label=f"target $z={Z_TARGET}$")
+    axes[0].set_xticks(range(1, len(STAGE1_METHODS) + 1), [STAGE1_METHOD_SHORT[m] for m in STAGE1_METHODS])
     axes[0].set_ylabel("Terminal wealth")
     axes[0].set_title("Stage 1: pooled across 5 seeds x 1000 paths")
+    axes[0].legend(fontsize=8, loc="upper left")
     axes[0].grid(alpha=0.3)
 
     s2 = combined[combined.stage == "stage2"]
     data2 = [s2[s2.method == m]["net_terminal_wealth"].to_numpy() for m in STAGE2_METHODS]
     axes[1].violinplot(data2, showmeans=True, showextrema=False)
-    axes[1].set_xticks(range(1, len(STAGE2_METHODS) + 1), STAGE2_METHODS, rotation=20, ha="right")
+    axes[1].axhline(Z_TARGET, color="tab:red", linestyle="--", linewidth=1, label=f"target $z={Z_TARGET}$")
+    axes[1].set_xticks(range(1, len(STAGE2_METHODS) + 1), [STAGE2_METHOD_SHORT[m] for m in STAGE2_METHODS],
+                       rotation=20, ha="right")
     axes[1].set_ylabel("Net terminal wealth")
     axes[1].set_title("Stage 2: pooled across 5 seeds x 1000 paths")
+    axes[1].legend(fontsize=8, loc="upper left")
     axes[1].grid(alpha=0.3)
-    fig.suptitle("Terminal wealth distribution by method (violin, mean shown)")
+    fig.suptitle("Terminal wealth distribution by method (violin, mean shown, target level marked).\n"
+                "Descriptive visualization of pooled paths, not treated as 5000 independent observations for inference.",
+                fontsize=10)
     fig.tight_layout()
     fig.savefig(out_dir / "figures" / "fig2_terminal_wealth_distribution.pdf")
     fig.savefig(out_dir / "figures" / "fig2_terminal_wealth_distribution.png", dpi=200)
@@ -857,11 +952,11 @@ def fig4_cost_turnover(agg: pd.DataFrame, out_dir: Path):
                         "ci95_low": r["ci95_low"], "ci95_high": r["ci95_high"]})
         x = np.arange(len(STAGE2_METHODS))
         ax.bar(x, means, yerr=errs, capsize=4, color="tab:blue", alpha=0.8)
-        ax.set_xticks(x, STAGE2_METHODS, rotation=20, ha="right", fontsize=8)
+        ax.set_xticks(x, [STAGE2_METHOD_SHORT[m] for m in STAGE2_METHODS], rotation=20, ha="right", fontsize=8)
         ax.set_title(title)
         ax.grid(alpha=0.3, axis="y")
-    fig.suptitle("Stage 2: cost / turnover comparison across methods "
-                 "(bars = 5-seed mean, error bars = 95% CI across training seeds)")
+    fig.suptitle("Stage 2: cost / turnover comparison across methods (bars = 5-seed mean, "
+                 "error bars = 95% Student-$t$ training-seed interval, four degrees of freedom)")
     fig.tight_layout()
     fig.savefig(out_dir / "figures" / "fig4_cost_turnover.pdf")
     fig.savefig(out_dir / "figures" / "fig4_cost_turnover.png", dpi=200)
@@ -1035,7 +1130,13 @@ def main():
         s2.loc[s2["seed"] == s, "runtime_seconds"] = rt2
         s2.loc[s2["seed"] == s, "runtime_source"] = src2
 
+    print("Computing utility-consistent metrics from episode-level data...", file=sys.stderr)
+    util = utility_consistent_metrics(base)
+    util.to_csv(out / "utility_consistent_metrics.csv", index=False)
+
     seed_level = pd.concat([s1, s2], ignore_index=True)
+    seed_level = seed_level.merge(
+        util.drop(columns=["n_eval_paths"]), on=["stage", "seed", "method"], how="left")
     seed_level.to_csv(out / "seed_level_results.csv", index=False)
 
     print("Computing cross-seed (second-stage) statistics...", file=sys.stderr)
@@ -1080,6 +1181,7 @@ def main():
     table1 = make_table1(agg, out)
     table2 = make_table2(agg, out)
     make_table3(paired, out)
+    make_table4_full_intervals(agg, out)
 
     print("Building ICA report figures...", file=sys.stderr)
     fig1_mean_vs_std(seed_level, agg, out)
