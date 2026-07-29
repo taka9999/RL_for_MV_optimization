@@ -139,3 +139,162 @@ separation:
 
 Commit hashes are recorded in the branch history immediately following this
 report's own commit.
+
+## 8. Editorial-cleanup pass (post-review)
+
+A follow-up editorial-cleanup pass, prior to pushing the branch, removed the
+remaining implementation-history wording flagged in review:
+
+- Renamed "Legacy threshold labeling" -> "Threshold-based labeling" and "In
+  the legacy configuration" -> "In the threshold-based configuration"; `legacy`
+  no longer appears anywhere in the paper.
+- Verified, read-only, the SJM rolling-feature construction code
+  (`poemv_rs/train_stage1_cov_modes_with_estimation.py`: `_roll_mean`,
+  `_roll_std`, `_rolling_downside_dev`, `_rolling_drawdown_from_returns`,
+  `_rolling_cumret`, all sliced as `x[max(0, t-win+1):t+1]`). Every raw
+  rolling feature is confirmed causal (backward-looking only). However, the
+  subsequent `_zscore_cols` standardization step normalizes using the full
+  estimation sample's mean/standard deviation, which is **not** a causal,
+  online transformation. The paper's sentence was rewritten to state the
+  verified causality of the raw features precisely, while disclosing the
+  non-causal batch normalization step, rather than the previous blanket "is
+  intended to" claim.
+- Removed the unsupported "its noisier learning curve cannot be attributed to
+  a single source" sentence (Discussion, sources-of-performance section) and
+  the unsupported "the training curve is noisier" clause (Stage~1 regcov
+  results paragraph): no regcov training-curve figure or archived multi-seed
+  training-curve data is presented anywhere in the manuscript, so these
+  claims were not supportable as written. Replaced with a source-agnostic
+  statement that the reported performance difference cannot be attributed to
+  any single error layer (regime identification, parameter estimation,
+  filtering, control approximation, optimization), which is the scientifically
+  supported claim.
+- Shortened the SJM reproducibility-limitation paragraph in the main text to
+  a concise statement, moving the itemized detail (what is and is not
+  retained: estimation horizon, jump penalty, initializations, iteration
+  limit vs. rolling windows, normalization statistics, estimation seed) to
+  the Code and Data Availability appendix; removed workflow/session language
+  from the main exposition.
+- Deleted, without replacement, the standalone paragraph following
+  Figure~4 ("Per-iteration Stage~2 training diagnostics ... for each of the
+  five training seeds."): it described artifact-availability/figure-
+  production history rather than a scientific result and was unnecessary for
+  interpreting the figure. Post-deletion, `learning curve`/`training curve`
+  no longer appear anywhere in the manuscript (case-insensitive sweep: 0
+  hits for both terms).
+- Final case-insensitive sweep for `legacy`, `current revision`, `previous
+  version`, `superseded`, `earlier illustration`, `could not be regenerated`,
+  `missing file`, `retained image`, `technical QA`, `inventory`, `revision
+  map`, `bug`, `failed invocation`, `conversation`, `chat`, `prompt`,
+  `Claude`, `ChatGPT`, `Phase 1A`/`Phase~1A`, `as shown in the figure`,
+  `visual inspection`: **0 hits** for every term. `learning curve` has one
+  remaining hit, which explicitly states that no such figure is shown (used
+  to disclaim absence, not to claim unsupported visual evidence), and was
+  judged compliant with the review's intent rather than removed.
+- Recompiled twice: exit code 0 both passes; 0 undefined references; 0
+  multiply-defined labels; 2 pre-existing overfull `\hbox` warnings, both
+  sub-3pt (not major); 0 "Missing figure" placeholder text in the extracted
+  PDF; final page count unchanged at 37 pages. No tmux session and no
+  matching training/evaluation/supervisor process was running at the time of
+  this pass.
+- This cleanup was committed separately from the two commits described above,
+  per the requested three-commit history for this branch.
+
+## 9. Second editorial-cleanup pass (manuscript-only, pre-push)
+
+A further manuscript-only cleanup pass, still prior to pushing the branch,
+removed remaining artifact-management/workflow language while preserving
+scientific reproducibility content:
+
+- Replaced the "Code and Data Availability" appendix with a short "Code and
+  Reproducibility Materials" section (author-request availability statement;
+  synthetic-data statement; five-seed reproducibility statement; regcov
+  exploratory-status statement), removing all mention of commit identifiers,
+  checkpoint/manifest hashes, `run_manifest.csv`, and an as-yet-unpublished
+  repository URL.
+- Rewrote the repeated-seed-protocol paragraph to remove the history of two
+  initially empty Stage~1 evaluation outputs and their invocation-error
+  cause, replacing it with a direct description of the deterministic
+  evaluation-scenario design and the byte-identical-benchmark consistency
+  check.
+- Deleted, without replacement, the sentence about an "earlier, incompletely
+  archived exploratory run" and its unrecorded utility/coefficient settings.
+- Replaced the regime-dependent-covariance results' opening paragraph to
+  drop the mention of a non-regenerable figure/retained image, stating only
+  the experiment's scientific purpose and single-seed scope.
+- Simplified both Stage~1 and Stage~2 configuration-table captions to remove
+  references to `run_config.json`/`eval_config.json`/`aggregation_config.json`/
+  `run_manifest.csv`, source-script filenames, and "not transcribed from
+  memory" wording.
+- Removed the "Training/evaluation code provenance" row (commit identifier,
+  checkpoint/manifest hashes) from the main Stage~2 configuration table,
+  keeping the scientifically relevant checkpoint-selection-criterion row.
+- Replaced the long `utility_gamma`/`gamma_risk` walk-through with a short
+  statement that both parameters are inert under the reported log-utility,
+  direct-gap configuration; removed the archived-manifest cross-reference
+  and the literal `best_checkpoint.pt` filename (the checkpoint-selection
+  criterion itself, and the checkpoint-selection/evaluation-policy mismatch
+  noted in an earlier pass, are retained as scientifically relevant).
+- Replaced "In trial runs... The final experiment therefore uses..." with a
+  direct statement that the tested QVI-residual/intervention optimization
+  scheme did not converge reliably, motivating Direct Boundary policy
+  optimization.
+- Removed the unsupported claim that "preliminary generic deep-RL and
+  Transformer-style formulations also failed" from the Stage~2 discussion
+  paragraph, retaining only the documented QVI critic/intervention
+  instability. (The similarly worded, but separately scoped, Introduction
+  sentence about preliminary Stage~1 architecture trials was left
+  unchanged, as it was outside this item's specified scope.)
+- Removed all mentions of `share_paths_avg_leverage_near_cap` and the
+  `1.980` threshold from the manuscript (table, captions, and the
+  Limitations list), replacing the corresponding limitation with a single
+  sentence stating that a time-resolved leverage-cap saturation measure is
+  not available.
+- Replaced two data-retention Limitations bullets (per-timestep wealth
+  trajectories; separate lower/upper boundary summaries) with
+  scientific-scope wording that states what the evaluation output contains
+  rather than what the evaluation code did or did not persist.
+- Replaced "remain future work unless completed before submission" with
+  "remain directions for future work".
+- Replaced the Appendix~B sentence describing the QVI critic/intervention
+  residual objective as "the intended... direction" that was found unstable
+  "in practice" with a direct statement that it is the QVI-based alternative
+  considered in the study, unstable under the tested optimization scheme.
+- Replaced both occurrences of "reconstructed from archived episode-level
+  terminal wealth" / "computed directly from the archived episode-level
+  terminal wealth" with "computed from episode-level terminal wealth".
+- Replaced the SJM section's retained-configuration paragraph with a two-
+  sentence statement of what is not documented and the resulting exploratory
+  interpretation, removing the sentence pointing to the (now-restructured)
+  Code and Data Availability appendix.
+- Verified the Generative-AI acknowledgment paragraph was not modified.
+- Final case-insensitive sweep across `archived`, `manifest`, `commit`,
+  `hash`, `run_config`, `eval_config`, `aggregation_config`, `run_manifest`,
+  `not transcribed`, `evaluation-invocation`, `empty output`, `no policy was
+  retrained`, `earlier run`, `retained image`, `missing figure`, `could not
+  be regenerated`, `trial runs`, `final experiment`, `available
+  experiments`, `before submission`, `training-script`, `CLI`, `legacy`,
+  `revision`, `technical QA`, `conversation`, `chat`, `prompt`, `Claude`,
+  `ChatGPT`, `Phase 1A`. Two categories of retained hits, both judged
+  compliant: (a) all 10 hits of `commit` are the financial term
+  "precommitted" (defined in the paper as the terminal criterion being fixed
+  at time 0, not reoptimized) or "committees" (an unrelated actuarial-
+  governance word), none referring to a source-control commit; (b) the
+  single `missing figure` hit is the literal fallback text embedded in the
+  `\imgorplaceholder` LaTeX macro definition (infrastructure code that would
+  only render if a figure file were absent, which none are), not narrative
+  text about the manuscript's own production history. Two initial residual
+  hits for `archived`/`manifest` and two for `training-script`/`CLI` were
+  found and fixed during this pass (an "archived manifest" phrase in the
+  Stage~2 wealth-recursion paragraph, an "archived run" phrase in the
+  expanded Stage~1 configuration table, and "training-script default"/"CLI-
+  configurable" phrasing in two configuration-table cells); after these
+  fixes, the sweep returns zero further hits.
+- Recompiled twice: exit code 0 both passes; 0 undefined references; 0
+  multiply-defined labels; the same 2 pre-existing sub-3pt overfull `\hbox`
+  warnings (not major); 0 "Missing figure" placeholder text in the extracted
+  PDF; page count unchanged at 37 pages. No tmux session and no matching
+  training/evaluation/supervisor process was running at the time of this
+  pass.
+- This pass amended the same editorial-cleanup commit (still unpushed)
+  rather than adding a new commit.

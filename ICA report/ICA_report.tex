@@ -740,7 +740,7 @@ Algorithm~\ref{alg:stage1} summarizes the complete Stage~1 loop. Regime paramete
 
 \section{Regime Estimation and Filtering in Practice}
 
-\subsection{Legacy threshold labeling}
+\subsection{Threshold-based labeling}
 
 The filter recursion is theory-driven, but its inputs must be estimated. The original heuristic route constructs a bull/bear path from an asset or equal-weight index. If $P_t$ is the index level, the rule switches from bull to bear when
 \begin{equation}
@@ -750,11 +750,11 @@ and from bear to bull when
 \begin{equation}
 P_t\ge P_t^{\mathrm{trough}}(1+Y_u).
 \end{equation}
-In the legacy configuration, $Y_l=0.19$ and $Y_u=0.24$ are fixed hyperparameters rather than cross-validated estimates. This method is transparent but sensitive to threshold selection and can produce unreliable labels in a multi-asset setting.
+In the threshold-based configuration, $Y_l=0.19$ and $Y_u=0.24$ are fixed hyperparameters rather than cross-validated estimates. This method is transparent but sensitive to threshold selection and can produce unreliable labels in a multi-asset setting.
 
 \subsection{Statistical jump model}
 
-The current regime-dependent-covariance experiment instead uses an equal-weight return index and constructs a standardized feature vector $z_k$ from rolling means and volatilities, downside deviation, rolling drawdown, short-versus-long mean spreads, and volatility ratios. Every rolling feature is intended to use information available at or before time $k$ only. A two-state statistical jump model jointly estimates regime representatives $\vartheta_1,\vartheta_2$ and a persistent label path $s_{1:n}$ by solving a problem of the form
+The current regime-dependent-covariance experiment instead uses an equal-weight return index and constructs a standardized feature vector $z_k$ from rolling means and volatilities, downside deviation, rolling drawdown, short-versus-long mean spreads, and volatility ratios. Every rolling feature (rolling mean, rolling standard deviation, downside deviation, rolling drawdown, and the derived spreads and ratios) is constructed using only return observations available at or before time $k$; the subsequent feature standardization (z-scoring), however, is computed from the mean and standard deviation of the full estimation sample and is therefore not itself a causal, online transformation. A two-state statistical jump model jointly estimates regime representatives $\vartheta_1,\vartheta_2$ and a persistent label path $s_{1:n}$ by solving a problem of the form
 \begin{equation}
 \min_{\vartheta_1,\vartheta_2,\,s_{1:n}}
 \sum_{k=1}^n\|z_k-\vartheta_{s_k}\|_2^2
@@ -763,7 +763,10 @@ The current regime-dependent-covariance experiment instead uses an equal-weight 
 \end{equation}
 The first term clusters economically similar feature observations; the jump penalty $\gamma_J$ suppresses implausibly rapid switching. The reported configuration uses a separate 20-year estimation sample, $\gamma_J=100$, $10$ random initializations, and at most $400$ iterations. The estimation sample is separated from the independently generated policy-evaluation paths.
 
-The archived configuration for the exploratory regime-dependent-covariance experiment (Section~\ref{sec:regcov_results}) records the estimation horizon and optimization settings, but it does not retain the exact rolling windows, feature-by-feature normalization statistics, or the random seed used to generate the estimation sample. This is a reproducibility limitation of that single-seed experiment specifically: unlike the common-covariance Stage~1/Stage~2 pipeline, whose per-seed configuration, checkpoints, and evaluation manifest are fully archived (Table~\ref{tab:stage2_config}), the regime-dependent-covariance run cannot currently be exactly reproduced from its saved artifacts alone, and it is excluded from the five-seed replication for this reason among others.
+The exact feature windows, feature-normalization statistics, and
+estimation-sample seed are not documented. The regime-dependent-covariance
+results are therefore interpreted as exploratory and are not included in
+the repeated-seed inference.
 
 The discrete SJM is fitted by block coordinate descent, as reviewed by Ayd{\i}nhan et al.~\cite{aydinhan2024}. For a fixed state path, the regime representatives solve
 \begin{equation}
@@ -1150,7 +1153,11 @@ The QVI formulation is the theoretically natural transaction-cost extension, but
 \item critic errors enter both the continuation residual and the intervention target $\mathcal M_\phi V$;
 \item the terminal mean--variance signal is delayed, while filtering and transaction costs add further pathwise noise.
 \end{itemize}
-In trial runs, the QVI residuals and intervention trigger did not converge reliably and produced unstable actor updates. The final experiment therefore uses \emph{Direct Boundary policy optimization}: a restricted no-trade policy is optimized directly through simulated trajectories by pathwise gradient descent on the terminal objective, without a separate learned transaction-cost critic or value function.
+Under the tested optimization scheme, the joint QVI residual and
+intervention updates did not converge reliably. The reported Stage~2
+implementation therefore uses Direct Boundary policy optimization, which
+optimizes a restricted no-trade policy directly through simulated
+trajectories, by pathwise gradient descent on the terminal objective and without a separate learned transaction-cost critic or value function.
 
 The distinction between the theoretical benchmark and the reported objective is important. The QVI above retains the Stage~1 mean--variance terminal condition, whereas the implemented Direct Boundary policy is trained using the terminal utility and regularization objective in \eqref{eq:band_loss}. Stage~2 is therefore not claimed to solve the exact transaction-cost extension of the Stage~1 problem. The frozen Stage~1 policy is used as a state-dependent structural feature and advanced start, and all reported Stage~2 policy comparisons are interpreted under the separate transaction-cost-aware objective.
 
@@ -1218,7 +1225,7 @@ x_{k+1}^-&=x_k^++(\bu_k^+)^\top R_{k+1}^{\mathrm{disc}},\\
 \end{align}
 where $R_{k+1}^{\mathrm{disc}}$ is the vector of discounted simple risky returns over $(t_k,t_{k+1}]$ and $\odot$ denotes componentwise multiplication. The next pre-trade weight is $\bw_{k+1}^-=\bu_{k+1}^-/x_{k+1}^-$. Elsewhere in the Direct Boundary description, $(x_k,\bw_k)$ denotes this pre-trade state $(x_k^-,\bw_k^-)$. This notation ensures that transaction costs are charged on the actual change from current pre-trade holdings to the selected post-trade target, rather than on the previous period's nominal post-trade dollars.
 
-The training and evaluation code uses this same pre-/post-trade timing convention throughout; the recursion version, checkpoint, and evaluation seeds are recorded in the archived manifest for every training seed (Table~\ref{tab:stage2_config}).
+The training and evaluation code uses this same pre-/post-trade timing convention throughout, with the evaluation seed recorded for every training seed (Table~\ref{tab:stage2_config}).
 The network is trained by differentiating through \eqref{eq:projection} and \eqref{eq:tc_wealth} (with $\bw_k^+=\bw_k^{\mathrm{band}}$, i.e.\ without the evaluation-time leverage cap \eqref{eq:eval_projection}). The implemented objective, minimized over an episode of $N$ steps and averaged over the $128$ simulated episodes per training iteration, is
 \begin{equation}
 \mathcal L_{\mathrm{band}}(\phi)
@@ -1239,9 +1246,9 @@ where
 \end{align}
 the outer $\E[\cdot]$ denotes the average over simulated episodes, $N=252$ is the number of daily steps in the one-year horizon, and the factor $\tfrac12$ in $\mathcal L_g$ is the average (not sum) of the squared lower- and upper-gap norms over the two risky assets. In the implemented code, $\lambda_U$ is the scalar \texttt{utility\_scale} and $s_U$ is an additive shift \texttt{utility\_shift}; for the reported runs $\lambda_U=1$ and $s_U=0$, so the term reduces to $-\E[U(x_T)]$ as in a standard terminal-utility objective. The physical proportional transaction cost is already deducted from wealth in \eqref{eq:tc_wealth}. The additional turnover term $\mathcal L_{to}$ is therefore a deliberate governance and training regularizer---and a simple proxy for unmodeled market impact---rather than a second accounting deduction of the same transaction cost. The gap term $\mathcal L_g$ discourages uninformatively wide bands; the gross-leverage term $\mathcal L_{gl}$ is the only leverage control active during training; the separate, evaluation-only hard cap is discussed above and in Section~\ref{sec:experimental_design}.
 
-In the reported configuration, $U$ is logarithmic utility, $U(x)=\log\bigl(\max(x,\epsilon)\bigr)$ with positivity floor $\epsilon=10^{-10}$ applied directly inside the utility evaluation (not as a separate bankruptcy-penalty term); no additional nonpositive-wealth penalty is added to the loss. The training code exposes two separate configuration fields that could plausibly be mistaken for a risk-aversion parameter, and neither functions as one for the reported configuration. First, \texttt{utility\_gamma} (recorded as $2.0$) is passed as the exponent argument to the utility function; it is used only by the ``power'' (CRRA) branch, where it would set the CRRA risk-aversion coefficient, but the logarithmic-utility branch actually selected by \texttt{utility\_kind=log} ignores this argument entirely, so $U(x)=\log(\max(x,\epsilon))$ regardless of its value. Second, \texttt{gamma\_risk} (recorded as $5.0$) enters only an alternative QVI-heuristic gap-width formula active under \texttt{gap\_mode=qvi\_exp}; the reported configuration (\texttt{gap\_mode=direct}) never invokes that formula, so \texttt{gamma\_risk} has no effect on the trained policy, the loss, or the boundary gaps. Both fields are retained in the archived configuration only because they are general-purpose fields of the training script; neither is, for this configuration, a risk-aversion parameter multiplying the utility. The loss coefficients used are $\lambda_{to}=5\times10^{-4}$ (\texttt{turnover\_coef}), $\lambda_g=10^{-5}$ (\texttt{gap\_l2\_coef}), and $\lambda_{gl}=10^{-5}$ (\texttt{gross\_lev\_coef}), as recorded in Table~\ref{tab:stage2_config} and the archived manifest for every training seed. The checkpoint used for evaluation (\texttt{best\_checkpoint.pt}) is selected, every $25$ training iterations, as the iteration with the highest mean validation utility $\E[U(x_T)]$ over $64$ held-out validation paths generated independently of both the training and the $1000$-path evaluation set. This validation utility is computed by the same band-only simulator used in training, i.e.\ without the evaluation-time leverage cap \eqref{eq:eval_projection}: the checkpoint-selection criterion and the final reported evaluation metrics are therefore not evaluated under an identical policy, since only the latter additionally applies the hard leverage cap on top of the learned band.
+In the reported configuration, $U$ is logarithmic utility, $U(x)=\log\bigl(\max(x,\epsilon)\bigr)$ with positivity floor $\epsilon=10^{-10}$ applied directly inside the utility evaluation (not as a separate bankruptcy-penalty term); no additional nonpositive-wealth penalty is added to the loss. Although the implementation exposes the parameters \texttt{utility\_gamma} and \texttt{gamma\_risk}, neither is active under the reported logarithmic-utility and direct-gap specification. Neither parameter therefore affects the reported policy or objective. The loss coefficients used are $\lambda_{to}=5\times10^{-4}$ (\texttt{turnover\_coef}), $\lambda_g=10^{-5}$ (\texttt{gap\_l2\_coef}), and $\lambda_{gl}=10^{-5}$ (\texttt{gross\_lev\_coef}), as recorded in Table~\ref{tab:stage2_config}. The checkpoint used for evaluation is selected, every $25$ training iterations, as the iteration with the highest mean validation utility $\E[U(x_T)]$ over $64$ held-out validation paths generated independently of both the training and the $1000$-path evaluation set. This validation utility is computed by the same band-only simulator used in training, i.e.\ without the evaluation-time leverage cap \eqref{eq:eval_projection}: the checkpoint-selection criterion and the final reported evaluation metrics are therefore not evaluated under an identical policy, since only the latter additionally applies the hard leverage cap on top of the learned band.
 
-Typical terminal utilities include logarithmic, square-root, and CRRA utility, all of which require an explicit treatment of nonpositive wealth. An earlier, incompletely archived exploratory run did not record the exact utility, utility floor or bankruptcy penalty, or the coefficients $(\lambda_U,\lambda_{to},\lambda_g,\lambda_{gl})$, and is not part of the seed-aggregated inference reported starting in Section~\ref{sec:stage1_results}.
+Typical terminal utilities include logarithmic, square-root, and CRRA utility, all of which require an explicit treatment of nonpositive wealth.
 
 Direct Boundary policy optimization is related to the HJB advanced-start strategy of Mulvey et al.~\cite{mulvey2020}: a tractable frictionless solution supplies information that makes the transaction-cost problem easier to learn. The QVI derivation above explains why a no-trade region and center-relative coordinates are natural, but the reported optimizer directly trains the restricted boundary policy class because the attempted QVI critic/intervention actor was unstable. The QVI model is retained as the theoretical benchmark and as a target for future stabilization work.
 
@@ -1304,7 +1311,7 @@ For Tables~\ref{tab:common_metrics} and \ref{tab:regcov_metrics}, mean shortfall
 \begin{table}[H]
 \centering
 \small
-\caption{Selected Stage~1 configuration parameters, read from the archived \texttt{run\_config.json} for the common-covariance track and cross-checked against the training-script argument defaults in \texttt{poemv\_rs/train.py} and \texttt{poemv\_rs/agent.py}. Optimizer and actor-mixing hyperparameters (rows below the double rule) are set by the same training-script CLI and were confirmed identical across the two tracks in every archived configuration file inspected; they are not independently re-tuned per track.}
+\caption{Selected Stage~1 configuration parameters for the common-covariance and regime-dependent-covariance tracks. Optimizer and actor-mixing hyperparameters (rows below the double rule) are shared between the two tracks and are not independently re-tuned per track.}
 \label{tab:configs}
 \begin{tabular}{>{\raggedright\arraybackslash}p{0.30\textwidth} >{\raggedright\arraybackslash}p{0.33\textwidth} >{\raggedright\arraybackslash}p{0.30\textwidth}}
 \toprule
@@ -1314,7 +1321,7 @@ Horizon / step & $1$ year / $1/252$ & $1$ year / $1/252$ \\
 Initial state & $(x_0,p_0)=(1,0.5)$ & $(x_0,p_0)=(1,0.5)$ \\
 Target / entropy & $z=1.2$, $\Lambda=1$ & $z=1.2$, $\Lambda=1$ \\
 Iterations & $9000$ & $9000$ \\
-Episodes per outer iteration & $16$ & varies by archived run; not fixed to a single value for this exploratory track \\
+Episodes per outer iteration & $16$ & not fixed to a single value for this exploratory track \\
 Covariance control & common $\bSigma$ & $\overline\bSigma(p)$ \\
 Filtering input & estimated parameters & estimated parameters \\
 Regime estimation & drawdown-threshold heuristic fit (Section~5.1) & statistical jump model (Section~5.2) \\
@@ -1331,8 +1338,8 @@ Learning-rate schedule & step decay by $0.5$ every $2000$ iterations & same \\
 Actor mixing weight $\eta$ (Eq.~\eqref{eq:mixed_signal}) & $0.3$ & same \\
 Exploration covariance scale & $0.1$ & same \\
 Belief-dependent value-function term & enabled (\texttt{g\_p\_dep=true}) & same \\
-Critic polynomial degree ($m$, $m_g$) & $2$, $2$ (training-script default, not CLI-configurable) & same \\
-Gradient clipping norm & $1.0$ (training-script default) & same \\
+Critic polynomial degree ($m$, $m_g$) & $2$, $2$ (fixed, not separately tuned) & same \\
+Gradient clipping norm & $1.0$ & same \\
 Advantage/signal normalization epsilon & $10^{-8}$ & same \\
 Checkpoint save frequency & every $250$ iterations & same \\
 Compute device & CPU & same \\
@@ -1343,7 +1350,7 @@ Compute device & CPU & same \\
 \begin{table}[H]
 \centering
 \small
-\caption{Stage~2 (Center+DNNBand) configuration for the five-seed replication. All entries are read from the archived \texttt{run\_config.json}, \texttt{eval\_config.json}, \texttt{aggregation\_config.json}, and \texttt{run\_manifest.csv} for each training seed, not transcribed from memory.}
+\caption{Stage~2 (Center+DNNBand) configuration for the five-seed replication.}
 \label{tab:stage2_config}
 \begin{tabular}{>{\raggedright\arraybackslash}p{0.31\textwidth} >{\raggedright\arraybackslash}p{0.59\textwidth}}
 \toprule
@@ -1363,7 +1370,6 @@ Optimizer / learning rate schedule & Adam, initial rate $5\times 10^{-4}$, step 
 Terminal objective & Log utility $U(x)=\log(\max(x,10^{-10}))$ (\texttt{utility\_gamma}/\texttt{gamma\_risk} recorded but numerically inert for this configuration -- see discussion below) plus turnover ($5\times10^{-4}$), gap-$L_2$ ($10^{-5}$), and gross-leverage ($10^{-5}$) regularization, as in \eqref{eq:band_loss} \\
 Checkpoint policy & Best-validation checkpoint selected every $25$ iterations on $64$ held-out validation paths; final-iteration checkpoint also retained \\
 Gross/net convention & $\text{gross terminal wealth} - \text{net terminal wealth} - \text{cumulative transaction cost} = 0$; confirmed to floating-point precision (maximum absolute error $\le 5.4\times10^{-16}$) for every seed and method \\
-Training/evaluation code provenance & Version-controlled commit identifier embedded in every checkpoint; per-seed evaluation code version and checkpoint/manifest hashes are given in Appendix~\ref{app:availability} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -1415,7 +1421,13 @@ Mean holding times & $(2.78,\,0.35)$ years & $(1.47,\,0.75)$ years \\
 
 The common-covariance Stage~1 and Stage~2 experiments were repeated with five independent training seeds. Each trained policy was evaluated on the same fixed set of $1000$ held-out market paths. Reported cross-seed intervals are based on the five seed-level statistics and use the Student-$t$ critical value with four degrees of freedom. These intervals quantify sensitivity to training initialization under the fixed evaluation design; they should not be interpreted as confidence intervals covering all sources of market-model or parameter uncertainty.
 
-Where two methods were evaluated on the same simulated paths, paired differences were first calculated at the episode level, summarized within each training seed, and then aggregated across the five training seeds. The run manifest records the training seed, checkpoint path and hash, evaluation directory, configuration, evaluation-path count, and run status. Two initially empty Stage~1 evaluation outputs, caused by an evaluation-invocation error unrelated to model training, were excluded and replaced by evaluations of the same, already-completed checkpoints; no policy was retrained. No independent scenario-hash or per-path seed identifier was persisted alongside the stored evaluation output (only the integer path index, $0$--$999$); each path's underlying random scenario is instead determined deterministically by the fixed evaluation seed ($999$) and path index via the simulator's seeding convention, and was not independently re-verified path-by-path. As a consistency check on this convention having been applied identically across all five training seeds, the equal-weight (Stage~1) and equal-weight-monthly (Stage~2) comparators do not depend on the trained policy. Byte-identical deterministic benchmark outputs across all seeds provide a strong consistency check that the same evaluation scenarios were used.
+All policies were evaluated on the same deterministic set of $1000$
+held-out scenarios, generated from the fixed evaluation seed and path index.
+Paired differences were computed at the episode level, summarized within
+each training seed, and then aggregated across the five training seeds using
+the Student-$t$ critical value with four degrees of freedom. Byte-identical
+outputs from deterministic benchmark policies across training seeds provide
+an additional consistency check on scenario alignment.
 
 The regime-dependent-covariance experiment reported in Section~\ref{sec:regcov_results} was not part of this five-seed replication and remains a single-seed exploratory result (Section~\ref{sec:regcov_results}).
 
@@ -1461,7 +1473,10 @@ Across the five training seeds, HJB-guided RL achieved mean terminal wealth $1.1
 \subsubsection{Exploratory regime-dependent-covariance experiment}
 \label{sec:regcov_results}
 
-The regime-dependent-covariance experiment was not included in the five-seed replication. Its table below reports a separate single-seed exploratory run, retained only to demonstrate implementability of the approximate filtering-and-control layer; no wealth-distribution figure is available for this single-seed run, so only the summary table and discussion are reported.
+Table~\ref{tab:regcov_metrics} reports a separate single-seed evaluation
+of the regime-dependent-covariance extension. Its purpose is to assess the
+implementability of the approximate filtering-and-control architecture; no
+multiple-seed inference is drawn from this experiment.
 
 \begin{table}[H]
 \centering
@@ -1479,7 +1494,7 @@ Approximate HJB RL & $1.132$ & $0.172$ & $0.030$ & $0.342$ & $0.112$ \\
 \end{tabular}
 \end{table}
 
-In this single exploratory run, the regime-dependent policy has the highest displayed mean and the lowest dispersion. Its gain in target-hit probability is more modest than in the common-covariance run, and the training curve is noisier. This is consistent with the SJM transition-rate mismatch and with the additional approximation in \eqref{eq:effective_wealth_regcov}--\eqref{eq:regcov_f_pde}. The discrete-time Gaussian filtering--correction step is exact for the adopted observation model, but the belief-averaged control layer is a moment-matched approximation with no verification theorem. These numbers demonstrate promising behavior for the implemented surrogate under a single training initialization; they do not prove optimality for the original regime-dependent continuous-time model, and no multi-seed inference or general dominance claim is made for this experiment.
+In this single exploratory run, the regime-dependent policy has the highest displayed mean and the lowest dispersion. Its gain in target-hit probability is more modest than in the common-covariance run. This is consistent with the SJM transition-rate mismatch and with the additional approximation in \eqref{eq:effective_wealth_regcov}--\eqref{eq:regcov_f_pde}. The discrete-time Gaussian filtering--correction step is exact for the adopted observation model, but the belief-averaged control layer is a moment-matched approximation with no verification theorem. These numbers demonstrate promising behavior for the implemented surrogate under a single training initialization; they do not prove optimality for the original regime-dependent continuous-time model, and no multi-seed inference or general dominance claim is made for this experiment.
 
 \subsection{Stage 2 results}
 
@@ -1503,7 +1518,7 @@ Equal weight, monthly & $1.0372$ (seed-invariant) & $1.0401$ & $0.0029$ & $0.005
 \end{tabular}}
 \end{table}
 
-Gross terminal wealth in Table~\ref{tab:stage2_means} is not an independently re-simulated no-cost scenario: it shares the identical sequence of realized post-trade dollar positions and returns with net terminal wealth, and simply omits the transaction-cost debit at each step, so that by construction gross minus net equals cumulative transaction cost (verified to floating-point precision, Table~\ref{tab:stage2_config}). It does not represent what the policy would have traded, nor what it would have earned, in a world without transaction costs. Table~\ref{tab:full_intervals} in Appendix~\ref{app:paired_full} additionally reports 95\% training-seed intervals for target achievement probability, target MSD, mean shortfall, cumulative transaction cost, turnover, trade count, band width, and mean terminal log-utility with its certainty equivalent (computed directly from the archived episode-level terminal wealth using the same positivity floor as training, $\epsilon=10^{-10}$) for every Stage~1 and Stage~2 method. Because only Stage~2 was trained against this log-utility objective, the Stage~2 values are objective-consistent evaluation metrics, whereas the Stage~1 values are post-hoc distributional summaries computed under an objective (log utility) different from the one Stage~1 was trained under (precommitted mean--variance).
+Gross terminal wealth in Table~\ref{tab:stage2_means} is not an independently re-simulated no-cost scenario: it shares the identical sequence of realized post-trade dollar positions and returns with net terminal wealth, and simply omits the transaction-cost debit at each step, so that by construction gross minus net equals cumulative transaction cost (verified to floating-point precision, Table~\ref{tab:stage2_config}). It does not represent what the policy would have traded, nor what it would have earned, in a world without transaction costs. Table~\ref{tab:full_intervals} in Appendix~\ref{app:paired_full} additionally reports 95\% training-seed intervals for target achievement probability, target MSD, mean shortfall, cumulative transaction cost, turnover, trade count, band width, and mean terminal log-utility with its certainty equivalent (computed from episode-level terminal wealth using the same positivity floor as training, $\epsilon=10^{-10}$) for every Stage~1 and Stage~2 method. Because only Stage~2 was trained against this log-utility objective, the Stage~2 values are objective-consistent evaluation metrics, whereas the Stage~1 values are post-hoc distributional summaries computed under an objective (log utility) different from the one Stage~1 was trained under (precommitted mean--variance).
 
 \begin{table}[H]
 \centering
@@ -1541,8 +1556,6 @@ The mean descriptive difference between Stage~2 net terminal wealth and Stage~1 
 \label{fig:stage2_cost_turnover}
 \end{figure}
 
-Per-iteration Stage~2 training diagnostics (terminal-objective and boundary-loss learning curves) are not shown as a figure here, since no such multi-seed visualization exists among the archived outputs; the underlying per-iteration training metrics remain available in the archived run outputs for each of the five training seeds.
-
 \section{Discussion}
 
 \subsection{Practical implications}
@@ -1563,7 +1576,7 @@ For regime-dependent covariance, the discrete-time Gaussian prediction--correcti
 
 The experiments suggest an asymmetric role for structural theory. In Stage~1, the common-covariance HJB identifies the Gaussian policy family, the linear dependence of its mean on wealth, the quadratic critic, and the lower-dimensional coefficient functions. These restrictions remove large parts of the learning problem without materially narrowing the theorem-level optimizer. The resulting actor--critic provided usable training and favorable displayed results under both common and regime-dependent covariance. The very small between-seed dispersion in Stage~1 (between-training-seed standard deviation of mean terminal wealth $\approx 0.000232$, against a within-seed evaluation-path standard deviation of $0.267$) is consistent with the stabilizing role of the HJB-restricted actor and critic, although the current experiments do not causally identify that restriction as the source of stability: because a controlled structured-versus-unstructured ablation has not yet been completed, the present evidence does not identify the restrictions themselves as the sole cause of the observed performance.
 
-The Stage~2 experience is different. The QVI identifies the enlarged state, the intervention-versus-continuation logic, and the relevance of a no-trade region, but it does not determine the finite-horizon multidimensional boundary geometry as sharply as the Stage~1 HJB determines the Gaussian actor. Jointly learning the QVI critic, obstacle residual, trigger, and intervention map was unstable, while preliminary generic deep-RL and Transformer-style formulations also failed to produce a sufficiently reliable policy within the available experiments. This comparison does not identify the encoder architecture or the absence of a particular parametrization as the unique cause of instability. The Direct Boundary architecture instead imposed economically meaningful center-relative no-trade geometry, retained feasibility constraints and pathwise transaction costs, and produced a numerically usable implementation. Consistent with a less sharply identified boundary geometry, the between-training-seed standard deviation of mean net terminal wealth for the end-to-end Stage~1-plus-Stage~2 pipeline (each seed's Stage~2 policy is trained against that same seed's own Stage~1 center checkpoint, so the two stages' initializations are not varied independently) was approximately $0.0163$ -- about $70$ times larger than Stage~1 alone's between-training-seed standard deviation of mean terminal wealth ($\approx 0.000232$) -- indicating materially greater sensitivity to training initialization than Stage~1 under the same five-seed protocol. This reflects the combined pipeline's sensitivity, not an isolated measurement of the Stage~2 optimizer with a fixed Stage~1 center held constant across seeds.
+The Stage~2 experience is different. The QVI identifies the enlarged state, the intervention-versus-continuation logic, and the relevance of a no-trade region, but it does not determine the finite-horizon multidimensional boundary geometry as sharply as the Stage~1 HJB determines the Gaussian actor. Jointly learning the QVI critic, obstacle residual, trigger, and intervention map was unstable. The Direct Boundary architecture instead imposed economically meaningful center-relative no-trade geometry, retained feasibility constraints and pathwise transaction costs, and produced a numerically usable implementation. Consistent with a less sharply identified boundary geometry, the between-training-seed standard deviation of mean net terminal wealth for the end-to-end Stage~1-plus-Stage~2 pipeline (each seed's Stage~2 policy is trained against that same seed's own Stage~1 center checkpoint, so the two stages' initializations are not varied independently) was approximately $0.0163$ -- about $70$ times larger than Stage~1 alone's between-training-seed standard deviation of mean terminal wealth ($\approx 0.000232$) -- indicating materially greater sensitivity to training initialization than Stage~1 under the same five-seed protocol. This reflects the combined pipeline's sensitivity, not an isolated measurement of the Stage~2 optimizer with a fixed Stage~1 center held constant across seeds.
 
 The methodological lesson is not that stronger structural restrictions are always preferable. Theory-guided parametrization is most effective when the underlying control equation identifies the relevant functional form with sufficient precision. When theory supplies only local or qualitative information about a free boundary, a softer inductive bias combined with simulation-based learning may be preferable to enforcing a misspecified low-dimensional geometry. The formula-based QVI actor remains valuable as an interpretable target and potential regularizer, but not yet as the reported optimizer.
 
@@ -1577,7 +1590,7 @@ Performance in the regime-aware pipeline can be affected at five distinct layers
 \item \textbf{Control approximation error:} the belief-averaged regime-dependent covariance model may differ from the original partially observed dynamics.
 \item \textbf{Optimization error:} actor--critic or boundary training may converge slowly, become unstable, or settle at a poor local solution.
 \end{enumerate}
-The current regime-dependent experiment combines all five effects, so its noisier learning curve cannot be attributed to a single source. The SJM transition-rate mismatch provides direct evidence of parameter risk, while the additional $f_p^2/f$ term and moment matching identify a separate control-model risk. The displayed approximate HJB policy has higher mean terminal wealth and lower dispersion than the static benchmarks, which supports the usefulness of the structural approximation in this setting, but it does not establish universal dominance or isolate the source of the improvement.
+The exploratory regime-dependent experiment combines regime-identification, parameter-estimation, filtering, control-approximation, and optimization errors, so the reported performance difference cannot be attributed to any single layer. The SJM transition-rate mismatch provides direct evidence of parameter risk, while the additional $f_p^2/f$ term and moment matching identify a separate control-model risk. The displayed approximate HJB policy has higher mean terminal wealth and lower dispersion than the static benchmarks, which supports the usefulness of the structural approximation in this setting, but it does not establish universal dominance or isolate the source of the improvement.
 
 The SJM produced a practically usable persistent segmentation in the reported experiment, but the present study does not establish superiority over HMM-based estimation. A controlled comparison should examine label stability, parameter error, posterior filtering accuracy, and downstream portfolio performance under common data and evaluation paths. The current claim is limited to the operational value of combining transparent offline SJM segmentation with online Bayesian belief updating.
 
@@ -1593,9 +1606,9 @@ The common-covariance Stage~1 and Stage~2 results are verified across five indep
 \item The regime-dependent-covariance experiment (Section~\ref{sec:regcov_results}) remains single-seed and exploratory; it is not part of the five-seed replication.
 \item Transaction-cost sensitivity (varying $\kappa$ and the leverage cap) has not been examined.
 \item An actor-signal ablation separating the martingale and full-horizon terms, and a structured-versus-unstructured policy-class ablation, have not been performed.
-\item Per-timestep wealth trajectories were not persisted by the evaluation code, so a time-resolved (rather than terminal-only) multi-seed wealth-path analysis is not currently available.
-\item A true, time-resolved cap-saturation rate has not been measured. The reported \texttt{share\_\allowbreak paths\_\allowbreak avg\_\allowbreak leverage\_\allowbreak near\_\allowbreak cap} diagnostic (threshold: whole-path average gross leverage $\ge 1.980$) is a path-average proxy over the fraction of evaluation paths, not a per-timestep saturation rate, and should not be read as one. This diagnostic is uninformative for Stage~2: because every reported Stage~2 comparator is rescaled to gross leverage at most $1.5$ by the evaluation-time cap \eqref{eq:eval_projection}, its whole-path average gross leverage can never reach the $1.980$ threshold, so the statistic is zero by construction for all four Stage~2 methods. It is meaningful only for the uncapped Stage~1 policy, where the archived values are approximately $1$--$1.5\%$ of evaluation paths across the five training seeds. The specific numeric value of the $1.980$ threshold is a fixed constant in the aggregation script with no derivation recorded in the code or configuration files linking it to the Stage~1 action bound or the Stage~2 leverage cap; its precise provenance is therefore not established and is not further interpreted here.
-\item Separate lower- and upper-boundary summary statistics were not persisted by the evaluation code; only the combined band width is reported.
+\item The evaluation output contains terminal wealth and path-level summary statistics but not complete time-series wealth trajectories, precluding a time-resolved multi-seed wealth-path analysis.
+\item A time-resolved leverage-cap saturation measure is not available.
+\item Only the combined band width is available; separate lower- and upper-boundary summaries are not reported.
 \item Stage~1 and Stage~2 optimize different terminal objectives, so comparisons between them (Section~\ref{sec:stage2_vs_stage1}) are descriptive, not a test of dominance under a common objective.
 \item Filtering quality depends on the regime segmentation and parameter estimates, and the estimated transition persistence differs materially from the simulator in the regime-dependent-covariance experiment; the associated control layer is moment-matched rather than exact, and $\widetilde c(p)$ has not been identified from a continuous-time filtering theorem.
 \item The attempted QVI-based RL was unstable, and hard componentwise projection in Center+DNNBand is interpretable but does not represent the most general multidimensional intervention geometry.
@@ -1610,7 +1623,7 @@ The transaction-cost QVI derived in Section~7 provides the theoretical target,
 \end{equation}
 where $\mathcal M$ accounts for proportional wealth loss and a post-trade target map. The next methodological step is not to formulate this QVI again, but to stabilize its numerical learning: continuation/intervention sampling, obstacle-compatible losses, target networks for $\mathcal M V$, curriculum learning from a Direct Boundary policy, and smooth trigger approximations are natural candidates.
 
-Broader sensitivity to transaction-cost rates, entropy weights, and filtering misspecification, together with ablations separating the effects of the belief state, HJB-guided parametrization, martingale signal, full-horizon residual, symmetric versus asymmetric bands, and QVI-derived priors, remain future work unless completed before submission. Stronger benchmarks should include a full-information regime oracle retrained under that information structure, a true-parameter filtered policy, a myopic policy without the belief-hedging term, and a fixed symmetric band. Supplying the true regime directly to a policy trained only on filtered beliefs would instead be an out-of-distribution stress test, not a formal oracle comparison. An actuarial extension should introduce stochastic liability cash flows, funding-ratio or surplus objectives, regulatory capital constraints, and asset eligibility limits so that the portfolio controller becomes a component of a complete ALM problem.
+Broader sensitivity to transaction-cost rates, entropy weights, and filtering misspecification, together with ablations separating the effects of the belief state, HJB-guided parametrization, martingale signal, full-horizon residual, symmetric versus asymmetric bands, and QVI-derived priors, remain directions for future work. Stronger benchmarks should include a full-information regime oracle retrained under that information structure, a true-parameter filtered policy, a myopic policy without the belief-hedging term, and a fixed symmetric band. Supplying the true regime directly to a policy trained only on filtered beliefs would instead be an out-of-distribution stress test, not a formal oracle comparison. An actuarial extension should introduce stochastic liability cash flows, funding-ratio or surplus objectives, regulatory capital constraints, and asset eligibility limits so that the portfolio controller becomes a component of a complete ALM problem.
 
 \section{Conclusion}
 
@@ -1723,7 +1736,10 @@ A soft residual objective may combine terminal supervision with penalties for ne
 +\lambda_o\E[(R_{\mathrm{obs}}^-)^2]
 +\lambda_{co}\E[(R_{\mathrm{cont}}R_{\mathrm{obs}})^2],
 \end{equation}
-where $r^-=\min(r,0)$. This was the intended critic-based Stage~2 direction. In practice, simultaneous fitting of these residuals and the intervention actor was unstable, motivating the Direct Boundary policy optimization implementation reported in the main text.
+where $r^-=\min(r,0)$. This residual objective defines the QVI-based alternative considered in
+the study. Under the tested optimization scheme, simultaneous fitting of
+the residuals and intervention policy was unstable; the reported Stage~2
+results therefore use Direct Boundary policy optimization.
 
 \section{Complete Paired Comparisons and Metric Intervals}
 \label{app:paired_full}
@@ -1759,7 +1775,7 @@ Table~\ref{tab:full_intervals} reports 95\% Student-$t$ training-seed intervals 
 \begin{table}[H]
 \centering
 \footnotesize
-\caption{Distributional metrics and post-hoc log-utility summaries, 5-seed mean with 95\% Student-$t$ interval across training seeds (Stage~1: within-seed statistic over $1000$ paths; Stage~2: as Table~\ref{tab:stage2_means}). Target MSD and mean shortfall are derived from evaluation terminal wealth, not native solver outputs. Mean terminal utility and its log-utility certainty equivalent are reconstructed from archived episode-level terminal wealth using $U(x)=\log(\max(x,10^{-10}))$, the exact positivity floor used in training; these are objective-consistent only for Stage~2, which was trained against this objective, and are post-hoc distributional summaries (not objective-consistent) for the Stage~1 row, which was trained under a precommitted mean--variance criterion.}
+\caption{Distributional metrics and post-hoc log-utility summaries, 5-seed mean with 95\% Student-$t$ interval across training seeds (Stage~1: within-seed statistic over $1000$ paths; Stage~2: as Table~\ref{tab:stage2_means}). Target MSD and mean shortfall are derived from evaluation terminal wealth, not native solver outputs. Mean terminal utility and its log-utility certainty equivalent are computed from episode-level terminal wealth using $U(x)=\log(\max(x,10^{-10}))$, the exact positivity floor used in training; these are objective-consistent only for Stage~2, which was trained against this objective, and are post-hoc distributional summaries (not objective-consistent) for the Stage~1 row, which was trained under a precommitted mean--variance criterion.}
 \label{tab:full_intervals}
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{llcccc}
@@ -1794,12 +1810,20 @@ Equal weight, monthly & $0.0029$ (seed-invariant) & $0.0059$ (seed-invariant) & 
 \end{tabular}
 \end{table}
 
-\section{Code and Data Availability}
-\label{app:availability}
+\section{Code and Reproducibility Materials}
 
-All Stage~1 and Stage~2 training and evaluation code, the aggregation script used to compute every five-seed table and figure in Sections~\ref{sec:stage1_results}--\ref{sec:stage2_vs_stage1} from archived per-seed evaluation output, and the archived per-seed configuration, checkpoint, and evaluation manifests are maintained in a version-controlled repository. Each of the five training seeds' checkpoints embeds the exact source-code commit identifier used to produce it; a subsequent evaluation-only commit, which did not alter any trained model, was used to correct an evaluation-invocation error affecting two seeds (Section~\ref{sec:stage1_results}). Per-seed checkpoint and manifest SHA-256 hashes are recorded in the archived \texttt{run\_manifest.csv}. The repository is not yet public; it will be made available upon request to the author or at a public repository URL to be added at publication, subject to institutional approval.
+The implementation of the Stage~1 and Stage~2 methods, the experiment
+configurations, and the scripts used to generate the reported tables and
+figures are available from the author upon reasonable request. All numerical
+experiments use synthetic data generated from the models specified in the
+paper.
 
-Every numerical result, table, and figure in this paper is computed by the aggregation script directly from archived per-seed evaluation CSV/parquet output, with no manually transcribed or hand-computed values other than simple arithmetic shown explicitly in the text.
+The five-seed common-covariance experiments are reproducible from the
+corresponding configurations and evaluation outputs. For the exploratory
+regime-dependent-covariance experiment, the exact rolling-feature windows,
+feature-normalization statistics, and estimation-sample seed are not
+documented. That experiment is therefore presented as exploratory rather
+than as a fully reproducible numerical benchmark.
 
 \begin{thebibliography}{99}
 
