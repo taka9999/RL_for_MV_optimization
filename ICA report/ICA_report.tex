@@ -55,7 +55,7 @@
 \newcommand{\cH}{\mathcal{H}}
 \newcommand{\imgorplaceholder}[3]{%
   \IfFileExists{#3}{\includegraphics[width=#1,height=#2,keepaspectratio]{#3}}{%
-    \fbox{\parbox[c][#2][c]{#1}{\centering Missing figure\\[0.3em]\texttt{#3}}}}%
+    \fbox{\parbox[c][#2][c]{#1}{\centering Missing figure\\[0.3em]\texttt{\detokenize{#3}}}}}%
 }
 
 \newcommand{\ICAPaperTitle}{Structure-Guided Reinforcement Learning for Partially Observed\\
@@ -87,7 +87,7 @@ Multi-Period Portfolio Optimization with Transaction Costs}
 \vspace{0.35cm}
 {\large November 8th--13th, 2026\par}
 \vspace{0.45cm}
-{\small\itshape Draft version, July 26, 2026. Repeated-seed robustness analysis is in progress.\par}
+{\small\itshape Draft version, July 29, 2026. Five-seed common-covariance robustness analysis incorporated.\par}
 \vfill
 \begin{minipage}{0.88\textwidth}
 \small
@@ -109,7 +109,11 @@ The IAJ and the IAA will ensure that all reproductions of the paper acknowledge 
 \maketitle
 
 \begin{abstract}
-This paper develops a structure-guided learning framework for multi-period portfolio optimization with latent market regimes and proportional transaction costs. Stage~1 studies a precommitted mean--variance problem. Under common observation covariance, Wonham filtering produces a belief-state diffusion, and the entropy-regularized HJB equation yields a Gaussian exploratory policy and a wealth-quadratic value function. These results motivate a low-dimensional actor--critic rather than a generic black-box policy. A statistical jump model supplies regime-dependent drift, covariance, and switching-rate estimates to the online filter. For regime-dependent covariance, an exact Gaussian Bayes correction conditional on a discretized Markov prediction is combined with a moment-matched, belief-averaged control approximation and an approximate HJB structure. Stage~2 uses the frictionless policy as a state-dependent center for costly trading. A transaction-cost QVI provides the theoretical benchmark, but its joint critic/intervention learning was numerically unstable; the reported implementation therefore learns asymmetric no-trade boundaries by direct pathwise policy optimization. Representative simulations show higher mean terminal wealth with comparable or lower dispersion than the displayed static baselines in Stage~1, and higher displayed mean net terminal wealth than frequent center rebalancing in Stage~2. The paper distinguishes theorem-level results, approximate control structure, and numerically usable implementation, and interprets the framework as a portfolio-control building block for long-horizon institutional and actuarial applications rather than a complete asset--liability management model.
+This paper develops a structure-guided learning framework for multi-period portfolio optimization with latent market regimes and proportional transaction costs. Stage~1 studies a precommitted mean--variance problem. Under common observation covariance, Wonham filtering yields a belief-state diffusion, while the entropy-regularized HJB equation identifies a Gaussian exploratory policy and a wealth-quadratic value function. These results motivate a low-dimensional actor--critic rather than an unrestricted state-to-weight learner. A statistical jump model supplies regime-dependent parameter estimates to the online filter. For regime-dependent covariance, an exact Gaussian Bayes correction for the adopted discrete-time hidden Markov observation model is combined with a moment-matched control approximation and an approximate HJB structure.
+
+Stage~2 freezes the frictionless policy as a state-dependent center for costly trading. A transaction-cost QVI provides the theoretical benchmark, but joint critic--intervention learning was numerically unstable; the reported implementation therefore learns asymmetric no-trade boundaries through direct pathwise optimization.
+
+Across five independent training seeds evaluated on a common set of $1000$ held-out paths, the common-covariance Stage~1 policy was highly stable, with mean terminal wealth $1.1811$ and a 95\% Student-$t$ interval across training seeds of $[1.1808,1.1814]$. Center+DNNBand achieved mean net terminal wealth $1.2009$ with interval $[1.1807,1.2211]$, exceeded daily center rebalancing by $0.0910$ with interval $[0.0709,0.1112]$, and reduced mean trade count from $252$ to $175.8$. Its descriptive difference from Stage~1 was $0.0198$ with interval $[-0.0003,0.0400]$; because this interval includes zero and the two stages optimize different objectives, no Stage~1-versus-Stage~2 dominance claim is made. The regime-dependent-covariance experiment remains exploratory and single-seed. The framework is interpreted as a portfolio-control building block for institutional and actuarial applications rather than a complete asset--liability management model.
 \end{abstract}
 
 \noindent\textbf{Keywords:} continuous-time reinforcement learning; mean--variance portfolio selection; partial information; regime switching; transaction costs; no-trade region; actor--critic.
@@ -118,7 +122,7 @@ This paper develops a structure-guided learning framework for multi-period portf
 
 Dynamic portfolio choice becomes substantially harder when three realistic features are introduced simultaneously: investment opportunities vary across persistent market regimes, the regime is not directly observed, and trading incurs transaction costs. Partial information requires the investor to infer the state of the market from prices. Multi-period objectives require decisions to account for their effect on future wealth and information. Transaction costs make frequent rebalancing suboptimal and typically replace frictionless point targets by state-dependent no-trade regions. These features lead naturally to stochastic filtering, nonlinear dynamic programming, and high-dimensional policy optimization.
 
-The starting point of this study is the natural compatibility between portfolio choice and reinforcement learning. A portfolio rule is a policy that maps an information state into an asset allocation, while reinforcement learning is designed to learn state-dependent sequential decisions from interaction data. The central issue is therefore not only which learning algorithm to use, but also how to construct the state, policy class, and objective. Here financial domain knowledge enters all three components: filtering converts return histories into an economically interpretable regime belief; stochastic-control theory restricts the actor and critic to HJB-consistent forms; and the objective incorporates target wealth, exploration, turnover, and transaction costs. This structure is intended to improve sample efficiency, numerical stability, and interpretability relative to an unrestricted state-to-weight learner, although the present representative experiments do not isolate each benefit through a complete ablation study.
+The starting point of this study is the natural compatibility between portfolio choice and reinforcement learning. A portfolio rule is a policy that maps an information state into an asset allocation, while reinforcement learning is designed to learn state-dependent sequential decisions from interaction data. The central issue is therefore not only which learning algorithm to use, but also how to construct the state, policy class, and objective. Here financial domain knowledge enters all three components: filtering converts return histories into an economically interpretable regime belief; stochastic-control theory restricts the actor and critic to HJB-consistent forms; and the objective incorporates target wealth, exploration, turnover, and transaction costs. This structure is intended to improve sample efficiency, numerical stability, and interpretability relative to an unrestricted state-to-weight learner. The five-seed common-covariance experiments assess robustness to training initialization, but they do not isolate the contribution of each structural restriction through a controlled structured-versus-unstructured ablation; repeated-seed robustness and ablation are distinct open questions.
 
 This compatibility does not imply that reinforcement learning is necessary for every low-dimensional portfolio problem. Its role here is computational: it provides a simulation-based policy-approximation method when partial information, nonlinear objectives, and transaction costs make direct dynamic programming difficult to implement.
 
@@ -126,7 +130,7 @@ This restriction is particularly important in regime-switching markets. Abrupt c
 
 Regime changes are also not limited to expected returns. Volatility levels and cross-asset correlations can change materially across market conditions, and these covariance shifts directly affect diversification, risk budgets, capital requirements, and the scale of admissible positions. For practical portfolio and risk management, covariance misspecification may therefore be at least as consequential as drift misspecification. This motivates the regime-dependent-covariance extension, while the common-covariance model is retained as the theorem-level benchmark needed to identify which HJB structures can be transferred safely.
 
-This paper combines two complementary components. Stage~1 learns a frictionless portfolio policy under partial information. It starts from the continuous-time precommitted mean--variance formulation of Wu and Li~\cite{wu2024}, extends its structured actor--critic representation to multiple risky assets, and makes the filtering, policy, value function, and learning pipeline operational. Stage~2 first formulates the transaction-cost problem as a QVI on the enlarged state $(t,x,p,w)$. Because the corresponding critic-based RL implementation was not numerically stable in the current experiments, the reported method uses Direct Boundary RL: a neural policy predicts lower and upper no-trade boundaries around the frozen Stage~1 center and is trained by pathwise differentiation through the wealth recursion with proportional costs. The reported Stage~2 does not claim to solve the exact transaction-cost extension of the Stage~1 mean--variance problem: it uses the Stage~1 policy as a state-dependent structural feature and optimizes a separate transaction-cost-aware terminal objective.
+This paper combines two complementary components. Stage~1 learns a frictionless portfolio policy under partial information. It starts from the continuous-time precommitted mean--variance formulation of Wu and Li~\cite{wu2024}, extends its structured actor--critic representation to multiple risky assets, and makes the filtering, policy, value function, and learning pipeline operational. Stage~2 first formulates the transaction-cost problem as a QVI on the enlarged state $(t,x,p,w)$. Because the corresponding critic-based RL implementation was not numerically stable in the current experiments, the reported method uses Center+DNNBand, the implemented Direct Boundary RL policy: a neural policy predicts lower and upper no-trade boundaries around the frozen Stage~1 center and is trained by pathwise differentiation through the wealth recursion with proportional costs. We refer to this evaluated policy as Center+DNNBand throughout the remainder of the paper. The reported Stage~2 does not claim to solve the exact transaction-cost extension of the Stage~1 mean--variance problem: it uses the Stage~1 policy as a state-dependent structural feature and optimizes a separate transaction-cost-aware terminal objective.
 
 The organizing principle is \emph{structure-guided learning}. In Stage~1, the observable state is determined by filtering, the exploratory policy family is determined by the HJB, and the critic is restricted by the quadratic terminal condition. In Stage~2, classical transaction-cost theory motivates an inaction region, while the Stage~1 policy supplies a state-dependent anchor. Learning is therefore used to estimate a small set of economically meaningful objects rather than an unrestricted state-to-action map.
 
@@ -138,14 +142,16 @@ The paper makes the following four contributions.
 We integrate the statistical jump model idea into partially observed multi-asset portfolio optimization under a regime-switching geometric Brownian motion. Persistent offline SJM labels are converted into regime-specific drift, covariance, and transition-intensity estimates, which are then supplied to the online Bayesian filter. The contribution is the integration of an established regime-identification method with the HJB-guided control pipeline, rather than a new statistical theory for SJM.
 
 \item \textbf{An approximate HJB extension to regime-dependent covariance.}
-To retain an HJB-guided policy structure when volatility and correlation vary by regime, we combine an exact Gaussian Bayes correction for the specified discretized observation model with a moment-matched, belief-averaged state approximation. We derive the resulting approximate HJB, Gaussian exploratory policy, and coefficient equations, including the nonlinear term that vanishes in the common-covariance benchmark. This is an approximate theoretical contribution; no verification or approximation-error theorem is claimed. In the representative run, the surrogate produced higher mean terminal wealth and lower dispersion than the displayed static baselines, but its noisier training indicates that convergence and approximation quality remain open issues.
+To retain an HJB-guided policy structure when volatility and correlation vary by regime, we combine an exact Gaussian Bayes correction for the specified discretized observation model with a moment-matched, belief-averaged state approximation. We derive the resulting approximate HJB, Gaussian exploratory policy, and coefficient equations, including the nonlinear term that vanishes in the common-covariance benchmark. This is an approximate theoretical contribution; no verification or approximation-error theorem is claimed. In a separate exploratory single-seed experiment, the surrogate produced higher mean terminal wealth and lower dispersion than the displayed static baselines. This result is not part of the five-seed Phase~1A robustness analysis, and its noisier training indicates that convergence and approximation quality remain open issues.
 
 \item \textbf{A two-stage learning architecture for portfolio optimization with transaction costs.}
-Stage~1 learns a frictionless HJB-guided policy, which is then frozen as a state-dependent center for Stage~2. We formulate the costly problem through a QVI and derive a center-relative critic/intervention parametrization consistent with its continuation and intervention structure. Because joint QVI-residual and intervention learning was numerically unstable, the reported implementation retains the robust structural implications---a frictionless center, an inaction region, feasibility constraints, and pathwise transaction costs---and learns asymmetric boundaries directly. The contribution is a structured two-stage framework that separates frictionless policy learning from transaction-cost correction while optimizing a separate transaction-cost-aware terminal objective in Stage~2.
+Stage~1 learns a frictionless HJB-guided policy, which is then frozen as a state-dependent center for Stage~2. We formulate the costly problem through a QVI and derive a center-relative critic/intervention parametrization consistent with its continuation and intervention structure. Because joint QVI-residual and intervention learning was numerically unstable, the reported implementation retains the robust structural implications---a frictionless center, an inaction region, feasibility constraints, and pathwise transaction costs---and learns asymmetric boundaries directly. The contribution is a structured two-stage framework that separates frictionless policy learning from transaction-cost correction while optimizing a separate transaction-cost-aware terminal objective in Stage~2. Across five training seeds, the implemented boundary policy retained a positive paired net-wealth difference relative to the daily and monthly center-rebalancing comparators, while materially reducing trade frequency relative to daily rebalancing.
 
 \item \textbf{A TD-inspired implementation refinement for continuous-time actor--critic learning.}
 The Stage~1 actor update combines a local martingale increment, which plays a temporal-difference-like role, with a normalized full-horizon tail residual, which provides a Monte Carlo-like terminal correction. Together with the critic update, this mixed signal is designed to address finite-horizon credit assignment and provided a usable implementation in the reported experiments. It is presented as an algorithmic refinement rather than a new continuous-time RL theorem; a controlled actor-signal ablation remains to be completed.
 \end{enumerate}
+
+The common-covariance Stage~1 and Stage~2 experiments above are empirically validated on a common set of independently generated evaluation paths, repeated across five independent training seeds. For each training seed, the same fixed evaluation scenarios are used to compute seed-level summary statistics; these are then combined across seeds into a mean, a between-seed standard deviation, and a 95\% Student-$t$ interval with four degrees of freedom. Where two policies are compared on the same paths, paired differences are computed at the evaluation-episode level before aggregation across seeds. This design quantifies sensitivity to training initialization under a fixed market-evaluation design; it is not a claim about market-distribution uncertainty. Under this protocol, Stage~2 shows materially greater training-seed variability than Stage~1.
 
 \subsection*{Actuarial relevance and potential applications}
 
@@ -169,7 +175,7 @@ Component & Prior literature & This paper \\
 Stage~1 control & One-risky-asset hidden-regime benchmark; common-covariance multi-asset extension & Operational multi-asset actor--critic with explicit coefficient PDEs and implementation details \\
 Regime estimation & SJM-based persistent regime identification & SJM labels integrated into parameter estimation for online belief-state control \\
 Covariance structure & Common observation covariance in the theorem-level benchmark & Discretized Markov prediction and exact Gaussian Bayes correction plus an approximate belief-averaged HJB control layer \\
-Transaction costs & Classical no-trade regions and HJB-initialized boundary networks & Belief-conditioned two-stage learning with a frozen Stage~1 center and Direct Boundary RL \\
+Transaction costs & Classical no-trade regions and HJB-initialized boundary networks & Belief-conditioned two-stage learning with a frozen Stage~1 center and Center+DNNBand \\
 Actor update & Martingale-based continuous-time policy evaluation and gradient methods & Mixed local martingale and full-horizon rollout signal for finite-sample learning \\
 \bottomrule
 \end{tabular}
@@ -1233,7 +1239,7 @@ where
 \end{align}
 The physical proportional transaction cost is already deducted from wealth in \eqref{eq:tc_wealth}. The additional turnover term $\mathcal L_{to}$ is therefore a deliberate governance and training regularizer---and a simple proxy for unmodeled market impact---rather than a second accounting deduction of the same transaction cost. The gap and gross-leverage terms discourage uninformatively wide bands and positions close to the admissibility boundary.
 
-Typical terminal utilities include logarithmic, square-root, and CRRA utility, all of which require an explicit treatment of nonpositive wealth. The legacy representative-run artifacts do not identify the exact utility, utility floor or bankruptcy penalty, or the coefficients $(\lambda_U,\lambda_{to},\lambda_g,\lambda_{gl})$. Consequently, that run is retained only as an exploratory numerical illustration and will not enter seed-aggregated inference. The ongoing replication prospectively freezes the utility definition, positivity safeguard after transaction-cost deduction, and all loss coefficients in its manifest.
+Typical terminal utilities include logarithmic, square-root, and CRRA utility, all of which require an explicit treatment of nonpositive wealth. An earlier, incompletely archived exploratory run did not record the exact utility, utility floor or bankruptcy penalty, or the coefficients $(\lambda_U,\lambda_{to},\lambda_g,\lambda_{gl})$, and is not part of the seed-aggregated inference reported starting in Section~\ref{sec:stage1_results}. The Phase~1A five-seed replication instead uses logarithmic utility with a fixed risk-aversion parameter, a positivity safeguard applied after transaction-cost deduction, and the loss coefficients recorded in Table~\ref{tab:stage2_config} and in the archived manifest for every training seed.
 
 Direct Boundary RL is related to the HJB advanced-start strategy of Mulvey et al.~\cite{mulvey2020}: a tractable frictionless solution supplies information that makes the transaction-cost problem easier to learn. The QVI derivation above explains why a no-trade region and center-relative coordinates are natural, but the reported optimizer directly trains the restricted boundary policy class because the attempted QVI critic/intervention actor was unstable. The QVI model is retained as the theoretical benchmark and as a target for future stabilization work.
 
@@ -1267,7 +1273,7 @@ Direct Boundary RL is related to the HJB advanced-start strategy of Mulvey et al
 
 The reported experiments use a two-regime, two-risky-asset environment with one trading year, daily time steps, initial discounted wealth $x_0=1$, initial belief $p_0=0.5$, risk-free rate $r=0.01$, and Stage~1 target $z=1.2$. The common-covariance and regime-dependent covariance Stage~1 models are trained for $9000$ iterations. The latter uses the statistical jump model with jump penalty $100$, $10$ random initializations, and at most $400$ iterations.
 
-The transaction-cost experiment uses the common-covariance Stage~1 center, estimated-parameter filtering, proportional transaction cost $\kappa=0.002$, leverage cap $1.5$, and $500$ common evaluation paths. Under \eqref{eq:tc_wealth}, $\kappa=0.002$ represents 20 basis points per unit of absolute pre-to-post-trade risky-weight turnover, scaled by pre-trade wealth. Reported comparators include daily and monthly center rebalancing, equal weight, minimum variance, and the learned boundary policy.
+The Phase~1A transaction-cost experiment uses the common-covariance Stage~1 center, estimated-parameter filtering, proportional transaction cost $\kappa=0.002$, and $1000$ common evaluation paths. The leverage cap of $1.5$ is applied to the target portfolio weight at each evaluation-time rebalancing decision for every reported Stage~2 comparator; it is an evaluation-side constraint and is unrelated to the Stage~1 actor's own component-wise action bound (Table~\ref{tab:configs}), which is not enforced during Stage~2 training or evaluation. Under \eqref{eq:tc_wealth}, $\kappa=0.002$ represents 20 basis points per unit of absolute pre-to-post-trade risky-weight turnover, scaled by pre-trade wealth. Reported comparators include daily and monthly center rebalancing, monthly-rebalanced equal weight, and Center+DNNBand.
 
 For Tables~\ref{tab:common_metrics} and \ref{tab:regcov_metrics}, mean shortfall is defined by
 \begin{equation}
@@ -1299,23 +1305,28 @@ Multiplier EMA parameter & $0.5$ & $0.5$ \\
 \begin{table}[H]
 \centering
 \small
-\caption{Stage~2 configuration and reproducibility status for the representative run.}
+\caption{Stage~2 (Center+DNNBand) configuration for the Phase~1A five-seed replication. All entries are read from the archived \texttt{run\_config.json}, \texttt{eval\_config.json}, \texttt{aggregation\_config.json}, and \texttt{run\_manifest.csv} for each training seed, not transcribed from memory.}
 \label{tab:stage2_config}
 \begin{tabular}{>{\raggedright\arraybackslash}p{0.31\textwidth} >{\raggedright\arraybackslash}p{0.59\textwidth}}
 \toprule
-Item & Reported setting or current status \\
+Item & Reported setting \\
 \midrule
-Center policy & Common-covariance Stage~1 policy with estimated-parameter filtering \\
-Policy class & Feedforward network with separate softplus lower- and upper-gap heads \\
-Terminal objective & Utility term plus turnover, gap-width, and gross-leverage regularization as in \eqref{eq:band_loss} \\
-Transaction cost / leverage cap & $\kappa=0.002$ / $1.5$ \\
-Evaluation paths & $500$ independently generated common paths \\
-Optimizer & Adam \\
-Exact utility, positivity safeguard, and $(\lambda_U,\lambda_{to},\lambda_g,\lambda_{gl})$ & Not archived for the legacy representative run; frozen prospectively in the ongoing replication \\
-Hidden layers, width, activation, learning rate & Not archived for the legacy representative run; frozen prospectively in the ongoing replication \\
-Training iterations and episodes per iteration & Not archived for the legacy representative run; frozen prospectively in the ongoing replication \\
-Training seed, center checkpoint, run identifier & Not fully traceable for the legacy run; it is excluded from seed-aggregated inference \\
-Evaluation seed set and recursion version & Not fully traceable for the legacy run; frozen prospectively under \eqref{eq:tc_wealth} \\
+Stage~1 center source & Common-covariance Stage~1 checkpoint, same training seed as the Stage~2 run \\
+Filtering mode & Estimated parameters (\texttt{filter\_mode = estimated\_params}) \\
+Transaction cost $\kappa$ & $0.002$ (proportional, applied to pre-trade wealth) \\
+Evaluation-time leverage cap & $1.5$, applied to the target weight at each rebalancing decision; not enforced during Stage~2 training and unrelated to the Stage~1 actor's action bound \\
+Horizon / time step & $1$ year / $1/252$ ($\mathrm{d}t=0.0039683$) \\
+Stage~2 training iterations & $800$, with $128$ simulated episodes per iteration \\
+Training seeds & $5$ independent seeds ($0$--$4$) \\
+Evaluation paths & $1000$ common held-out paths per training seed, evaluation seed $999$ \\
+Evaluation scenario set & Identical across all $5$ training seeds; confirmed by byte-identical EW-Monthly comparator terminal wealth across seeds \\
+Policy architecture & Feedforward network, hidden width $64$, separate softplus lower- and upper-gap heads \\
+Optimizer / learning rate schedule & Adam, initial rate $5\times 10^{-4}$, step decay by $0.5$ every $100$ iterations \\
+Terminal objective & Log utility ($\gamma_{\mathrm{risk}}=5$) plus turnover ($5\times10^{-4}$), gap-$L_2$ ($10^{-5}$), and gross-leverage ($10^{-5}$) regularization, as in \eqref{eq:band_loss} \\
+Checkpoint policy & Best-validation checkpoint selected every $25$ iterations on $64$ held-out validation paths; final-iteration checkpoint also retained \\
+Gross/net convention & $\text{gross terminal wealth} - \text{net terminal wealth} - \text{cumulative transaction cost} = 0$; confirmed to floating-point precision (maximum absolute error $\le 5.4\times10^{-16}$) for every seed and method \\
+Training/evaluation code commit & \texttt{ba22728} (embedded in every checkpoint); Stage~1 evaluation for seeds $1$--$2$ was re-run under commit \texttt{04c4f2e} after a path-quoting invocation bug fix, without retraining \\
+Manifest / checkpoint hashes & Recorded per seed in \texttt{run\_manifest.csv} (SHA-256) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -1363,82 +1374,62 @@ Mean holding times & $(2.78,\,0.35)$ years & $(1.47,\,0.75)$ years \\
 \end{tabular}
 \end{table}
 
-\subsection{Draft robustness protocol and numerical provenance}
+\subsection{Repeated-seed robustness protocol and numerical provenance}
 
-The tables in this draft report representative single-training-seed results evaluated on independently generated simulation paths. A five-seed replication using a fixed common evaluation set is in progress but was not completed by the draft cutoff. Accordingly, the displayed results should be interpreted as evidence of feasibility and qualitative behavior rather than as statistically significant evidence of general dominance. The final analysis is intended to report seed-aggregated means, standard errors, 95\% confidence intervals, and paired comparisons where applicable.
+The common-covariance Stage~1 and Stage~2 experiments were repeated with five independent training seeds. Each trained policy was evaluated on the same fixed set of $1000$ held-out market paths. Reported cross-seed intervals are based on the five seed-level statistics and use the Student-$t$ critical value with four degrees of freedom. These intervals quantify sensitivity to training initialization under the fixed evaluation design; they should not be interpreted as confidence intervals covering all sources of market-model or parameter uncertainty.
 
-To avoid mixing results generated under different checkpoints or evaluation protocols, the present tables retain the runs used to generate the adjacent figures. The legacy Stage~2 run is shown only as an exploratory illustration because its complete training manifest and wealth-recursion version were not archived; it is excluded from the seed-aggregated analysis. The ongoing replication uses a frozen specification under which each reported value is linked to a manifest recording the training seed, checkpoint, evaluation-path seed set, number of paths, utility and regularization coefficients, transaction-cost specification, leverage treatment, wealth-recursion version, and gross-versus-net convention. Only results generated under that common specification will be aggregated.
+Where two methods were evaluated on the same simulated paths, paired differences were first calculated at the episode level, summarized within each training seed, and then aggregated across the five training seeds. The run manifest records the training seed, checkpoint path and hash, evaluation directory, configuration, evaluation-path count, and run status. Two empty Stage~1 evaluation directories produced by a previously identified path-quoting invocation error were excluded; the corrected evaluations used the original completed checkpoints and did not retrain the policies. Because no independent scenario-hash or path-seed record was persisted per path, agreement of the common evaluation set across seeds was instead confirmed by an evaluation-time consistency check: byte-identical deterministic benchmark outputs provided an additional consistency check, since the equal-weight (Stage~1) and equal-weight-monthly (Stage~2) comparators do not depend on the trained policy and are therefore expected to be identical across training seeds if and only if the same underlying evaluation paths were used.
+
+The regime-dependent-covariance experiment reported in Section~\ref{sec:regcov_results} was not part of this five-seed replication and remains a single-seed exploratory result (Section~\ref{sec:regcov_results}).
 
 \subsection{Stage 1 results}
+\label{sec:stage1_results}
 
-Figure~\ref{fig:stage1_common} summarizes the common-covariance benchmark. The learned policy improves during training and produces a higher average terminal outcome than the displayed static benchmarks while maintaining comparable or lower terminal dispersion in this representative run. This case is closest to the theory because both the innovation filter and HJB reduction use common covariance.
-
-\begin{figure}[H]
-\centering
-\begin{subfigure}[t]{0.32\textwidth}
-\centering
-\imgorplaceholder{\linewidth}{0.18\textheight}{file/learning_curves_comcov.png}
-\caption{Training diagnostics.}
-\end{subfigure}\hfill
-\begin{subfigure}[t]{0.32\textwidth}
-\centering
-\imgorplaceholder{\linewidth}{0.18\textheight}{file/avg_wealth_comcov.png}
-\caption{Average wealth.}
-\end{subfigure}\hfill
-\begin{subfigure}[t]{0.32\textwidth}
-\centering
-\imgorplaceholder{\linewidth}{0.18\textheight}{file/terminal_hist_comcov.png}
-\caption{Terminal wealth.}
-\end{subfigure}
-\caption{Representative Stage~1 results under common covariance.}
-\label{fig:stage1_common}
-\end{figure}
+Table~\ref{tab:common_metrics} summarizes the common-covariance benchmark across five independent training seeds, each evaluated on the same $1000$ held-out paths. This case is closest to the theory because both the innovation filter and HJB reduction use common covariance.
 
 \begin{table}[H]
 \centering
 \small
-\caption{Representative single-seed common-covariance held-out simulation summary.}
+\caption{Common-covariance Stage~1 performance across five independent training seeds. Bracketed values report 95\% Student-$t$ intervals across seed-level statistics (four degrees of freedom). Terminal-wealth dispersion (Std.\ $X_T$) is calculated across evaluation paths within each seed and is distinct from training-seed uncertainty. Equal weight and minimum variance do not depend on the trained policy and are seed-invariant by construction (zero-width interval).}
 \label{tab:common_metrics}
 \begin{tabular}{lccccc}
 \toprule
-Method & Mean $X_T$ & Std. $X_T$ & Var. $X_T$ & $\Pbb(X_T\ge z)$ & Mean shortfall \\
+Method & Mean $X_T$ & Std.\ $X_T$ (within seed) & $\Pbb(X_T\ge z)$ & Mean shortfall & Target MSD \\
 \midrule
-Equal weight & $1.070$ & $0.272$ & $0.074$ & $0.309$ & $0.187$ \\
-Minimum variance & $1.071$ & $0.261$ & $0.068$ & $0.311$ & $0.182$ \\
-HJB-guided RL & $1.197$ & $0.266$ & $0.071$ & $0.611$ & $0.115$ \\
+Equal weight & $1.0543$ (seed-invariant) & $0.2688$ & $0.304$ & $0.1943$ & $0.0934$ \\
+Minimum variance & $1.0530$ (seed-invariant) & $0.2567$ & $0.291$ & $0.1913$ & $0.0874$ \\
+HJB-guided RL & $1.1811$ [$1.1808$, $1.1814$] & $0.2667$ & $0.566$ & $0.1247$ & $0.0714$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The RL policy raises mean terminal wealth by approximately $0.126$ relative to minimum variance and nearly doubles the target-hit probability, while its standard deviation remains close to the static benchmarks. The improvement is therefore not explained solely by an increase in terminal dispersion.
-
-Figure~\ref{fig:stage1_regcov} reports the regime-dependent covariance extension. Learning is visibly noisier, which is consistent with parameter-estimation error and the additional belief-averaging approximation. Nevertheless, the displayed run continues to show improvement over training and favorable terminal outcomes relative to the static benchmarks. These results should be read as evidence of implementability, not as verification of the approximate control model.
+Across the five training seeds, HJB-guided RL achieved mean terminal wealth $1.1811$ with a 95\% training-seed interval of $[1.1808,1.1814]$, a target-achievement probability of $0.566$, and a target mean squared deviation (target MSD) of $0.0714$; target MSD is a derived metric computed as $\frac{1}{N_{\mathrm{eval}}}\sum_e (X_{T,e}-z)^2$ from the evaluation terminal-wealth sample, not a native solver output. The between-training-seed standard deviation of mean terminal wealth was approximately $0.000232$ -- more than three orders of magnitude smaller than the within-seed evaluation-path dispersion ($0.2667$) -- indicating that Stage~1 is extremely stable with respect to training initialization under this fixed evaluation design. Relative to minimum variance, HJB-guided RL raises mean terminal wealth by $1.1811-1.0530=0.1281$ and raises the target-achievement probability from $0.291$ to $0.566$; its within-seed standard deviation remains close to the static benchmarks, so the improvement is not explained solely by an increase in terminal dispersion.
 
 \begin{figure}[H]
 \centering
-\begin{subfigure}[t]{0.32\textwidth}
+\begin{subfigure}[t]{0.49\textwidth}
 \centering
-\imgorplaceholder{\linewidth}{0.18\textheight}{file/learning_curve_regcov.png}
-\caption{Training diagnostics.}
+\includegraphics[width=\linewidth]{file/phase1a/fig1_mean_vs_std.png}
+\caption{Mean terminal wealth vs.\ within-seed standard deviation, by training seed, with the five-seed mean and its 95\% training-seed interval.}
 \end{subfigure}\hfill
-\begin{subfigure}[t]{0.32\textwidth}
+\begin{subfigure}[t]{0.49\textwidth}
 \centering
-\imgorplaceholder{\linewidth}{0.18\textheight}{file/avg_wealth_regcov.png}
-\caption{Average wealth.}
-\end{subfigure}\hfill
-\begin{subfigure}[t]{0.32\textwidth}
-\centering
-\imgorplaceholder{\linewidth}{0.18\textheight}{file/terminal_hist_regcov.png}
-\caption{Terminal wealth.}
+\includegraphics[width=\linewidth]{file/phase1a/fig5_training_seed_variability.png}
+\caption{Mean terminal wealth by individual training seed, Stage~1 (left) and Stage~2 (right).}
 \end{subfigure}
-\caption{Representative Stage~1 results with regime-dependent covariance.}
-\label{fig:stage1_regcov}
+\caption{Training-seed robustness for the common-covariance HJB-guided policy (Stage~1, left panels) and Center+DNNBand (Stage~2, right panels). Both stages are shown together because the same five training seeds and evaluation design underlie both; Stage~1's near-total overlap of points contrasts with Stage~2's visibly larger spread.}
+\label{fig:stage1_common}
 \end{figure}
+
+\subsubsection{Exploratory regime-dependent-covariance experiment}
+\label{sec:regcov_results}
+
+The regime-dependent-covariance experiment was not included in the five-seed Phase~1A replication. Its table below reports a separate single-seed exploratory run and is retained only to demonstrate implementability of the approximate filtering-and-control layer; the corresponding figure could not be regenerated from a retained image file and has been removed rather than shown as a placeholder (Section~\ref{sec:regcov_results} retains the table and discussion only).
 
 \begin{table}[H]
 \centering
 \small
-\caption{Representative single-seed regime-dependent-covariance held-out simulation summary.}
+\caption{Single-seed exploratory regime-dependent-covariance held-out simulation summary. Not part of the five-seed Phase~1A replication; no training-seed interval is reported.}
 \label{tab:regcov_metrics}
 \begin{tabular}{lccccc}
 \toprule
@@ -1451,66 +1442,67 @@ Approximate HJB RL & $1.132$ & $0.172$ & $0.030$ & $0.342$ & $0.112$ \\
 \end{tabular}
 \end{table}
 
-The regime-dependent policy has the highest displayed mean and the lowest dispersion. Its gain in target-hit probability is more modest than in the common-covariance run, and the training curve is noisier. This is consistent with the SJM transition-rate mismatch and with the additional approximation in \eqref{eq:effective_wealth_regcov}--\eqref{eq:regcov_f_pde}. These numbers demonstrate promising behavior for the implemented surrogate; they do not prove optimality for the original regime-dependent continuous-time model.
+In this single exploratory run, the regime-dependent policy has the highest displayed mean and the lowest dispersion. Its gain in target-hit probability is more modest than in the common-covariance run, and the training curve is noisier. This is consistent with the SJM transition-rate mismatch and with the additional approximation in \eqref{eq:effective_wealth_regcov}--\eqref{eq:regcov_f_pde}. The discrete-time Gaussian filtering--correction step is exact for the adopted observation model, but the belief-averaged control layer is a moment-matched approximation with no verification theorem. These numbers demonstrate promising behavior for the implemented surrogate under a single training initialization; they do not prove optimality for the original regime-dependent continuous-time model, and no multi-seed inference or general dominance claim is made for this experiment.
 
 \subsection{Stage 2 results}
 
-Figure~\ref{fig:stage2_eval} compares the transaction-cost-aware policies. In the displayed experiment, the learned boundary policy has the strongest average net discounted wealth trajectory and a right-shifted terminal wealth distribution relative to center-only and static baselines. Turnover, cumulative transaction costs, and trade counts are not yet reported as separate summary statistics, so the current comparison supports a net-wealth statement rather than a complete performance--turnover decomposition.
-
-\begin{figure}[H]
-\centering
-\begin{subfigure}[t]{0.49\textwidth}
-\centering
-\imgorplaceholder{\linewidth}{0.27\textheight}{avg_wealth.png}
-\caption{Average discounted wealth paths.}
-\end{subfigure}\hfill
-\begin{subfigure}[t]{0.49\textwidth}
-\centering
-\imgorplaceholder{\linewidth}{0.27\textheight}{terminal_hist.png}
-\caption{Terminal wealth distributions.}
-\end{subfigure}
-\caption{Representative Stage~2 evaluation with proportional transaction costs.}
-\label{fig:stage2_eval}
-\end{figure}
+Table~\ref{tab:stage2_means} reports the five-seed transaction-cost-aware comparison. The previously reported legacy single-seed illustration (mean net terminal wealth $1.248$ for the boundary policy against $500$ evaluation paths, versus $1.136$/$1.147$/$1.052$ for the daily-center, monthly-center, and monthly-equal-weight comparators) used an incompletely archived training seed, checkpoint, and evaluation-path set; it is superseded here by the fully traceable Phase~1A five-seed replication (Table~\ref{tab:stage2_config}) and is not mixed into the table below.
 
 \begin{table}[H]
 \centering
 \small
-\caption{Legacy representative single-seed illustration of mean terminal discounted wealth net of proportional transaction costs ($500$ independently generated evaluation paths).}
+\caption{Stage~2 transaction-cost-aware performance across five independent training seeds, $1000$ common evaluation paths per seed. Bracketed net-terminal-wealth values report 95\% Student-$t$ intervals across training seeds. Band width is a structural quantity defined only for Center+DNNBand; ``--'' denotes not applicable, not zero.}
 \label{tab:stage2_means}
-\begin{tabular}{lc}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccc}
 \toprule
-Policy & Mean net terminal wealth \\
+Method & Net $X_T$ & Gross $X_T$ & Cum.\ tc & Turnover & Trades & Band width & $\Pbb(X_T\ge z)$ \\
 \midrule
-Direct Boundary RL around Stage~1 center & $1.248$ \\
-Center only, daily rebalance & $1.136$ \\
-Center only, monthly rebalance & $1.147$ \\
-Equal weight, monthly rebalance & $1.052$ \\
+Center+DNNBand & $1.2009$ [$1.1807$,\,$1.2211$] & $1.2196$ & $0.0187$ & $0.0397$ & $175.8$ & $1.740$ & $0.490$ \\
+CenterOnly, daily & $1.1099$ [$1.1097$,\,$1.1101$] & $1.1595$ & $0.0496$ & $0.1100$ & $252.0$ & -- & $0.426$ \\
+CenterOnly, monthly & $1.1229$ [$1.1228$,\,$1.1231$] & $1.1349$ & $0.0120$ & $0.0258$ & $12.0$ & -- & $0.437$ \\
+Equal weight, monthly & $1.0372$ (seed-invariant) & $1.0401$ & $0.0029$ & $0.0059$ & $12.0$ & -- & $0.281$ \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Selected Stage~2 paired comparisons. Differences are computed at the evaluation-path level within each training seed, averaged within the seed, and then aggregated across five training seeds; 95\% intervals use the Student-$t$ critical value with four degrees of freedom. The Stage~2-versus-Stage~1 row is a descriptive comparison across different terminal objectives, not a claim of dominance (Section~\ref{sec:stage2_vs_stage1}). A complete set of eleven paired comparisons, including all pairwise method differences and gross-minus-net decompositions, is reported in Appendix~\ref{app:paired_full}.}
+\label{tab:paired_comparisons}
+\begin{tabular}{lccc}
+\toprule
+Comparison & Mean difference & 95\% training-seed interval & Excludes zero? \\
+\midrule
+Center+DNNBand $-$ CenterOnly, daily & $0.0910$ & $[0.0709,\,0.1112]$ & yes \\
+Center+DNNBand $-$ CenterOnly, monthly & $0.0780$ & $[0.0578,\,0.0981]$ & yes \\
+Center+DNNBand $-$ Equal weight, monthly & $0.1637$ & $[0.1436,\,0.1839]$ & yes \\
+Stage~2 net $-$ Stage~1 terminal wealth & $0.0198$ & $[-0.0003,\,0.0400]$ & no \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The complete training seed, center checkpoint, evaluation seed set, utility coefficients, and pre-/post-trade recursion version were not archived for this legacy run. Table~\ref{tab:stage2_means} is therefore retained only to document the exploratory result associated with Figure~\ref{fig:stage2_eval}; it will not be included in seed-aggregated inference.
+Center+DNNBand achieved mean net terminal wealth $1.2009$ (95\% training-seed interval $[1.1807,1.2211]$), mean gross terminal wealth $1.2196$, mean cumulative transaction cost $0.0187$, mean turnover $0.0397$, a mean of $175.8$ trades, and mean band width $1.740$. Its paired difference against daily center rebalancing was $0.0910$ with interval $[0.0709,0.1112]$, which excludes zero. Center+DNNBand reduced the mean number of trades from $252$ under daily center rebalancing to $175.8$, a reduction of approximately 30\%. This reduction in trade frequency accompanies, but is not shown to causally explain, the net-wealth improvement: separating the contribution of trade frequency from boundary asymmetry, belief conditioning, and time-to-go conditioning would require an ablation study that has not been performed.
 
-In this test, Direct Boundary RL has mean net terminal wealth $0.101$ above monthly center rebalancing and $0.112$ above daily center rebalancing. The daily center does not dominate the monthly center because more frequent movement toward the frictionless target incurs additional proportional costs. A direct turnover attribution requires the additional turnover and cost statistics planned for the final analysis.
-
-The training diagnostics in Figure~\ref{fig:stage2_training} show improvement in the terminal objective and the direct boundary loss, although the pathwise optimization remains noisy. This behavior is expected because each gradient is computed through simulated returns, belief updates, projection decisions, and accumulated transaction costs. In contrast to the attempted QVI actor--critic, the direct boundary run did not collapse into an always-trade or never-trade policy and produced usable boundaries on independently generated evaluation paths.
+\label{sec:stage2_vs_stage1}
+The mean descriptive difference between Stage~2 net terminal wealth and Stage~1 terminal wealth was $0.0198$, with a 95\% training-seed interval of $[-0.0003,0.0400]$. Because the interval includes zero and the two stages optimize different terminal objectives (Stage~1 a precommitted mean--variance criterion, Stage~2 a transaction-cost-aware utility objective), this comparison does not establish that Stage~2 dominates Stage~1. It is also notable that, despite its higher mean terminal wealth, Center+DNNBand's target-achievement probability ($0.490$) is lower than Stage~1's ($0.566$): the two stages differ not only in mean level but in the shape of the terminal-wealth distribution relative to the target $z$, so policies should not be ranked by mean terminal wealth alone.
 
 \begin{figure}[H]
 \centering
-\begin{subfigure}[t]{0.49\textwidth}
-\centering
-\imgorplaceholder{\linewidth}{0.24\textheight}{learning_curve.png}
-\caption{Terminal-performance diagnostic.}
-\end{subfigure}\hfill
-\begin{subfigure}[t]{0.49\textwidth}
-\centering
-\imgorplaceholder{\linewidth}{0.24\textheight}{loss_curve.png}
-\caption{Direct boundary objective.}
-\end{subfigure}
-\caption{Stage~2 pathwise training diagnostics.}
-\label{fig:stage2_training}
+\includegraphics[width=0.85\linewidth]{file/phase1a/fig2_terminal_wealth_distribution.png}
+\caption{Terminal wealth distributions pooled across five training seeds and $1000$ evaluation paths each. Left: Stage~1 (RL, equal weight, minimum variance). Right: Stage~2 (Center+DNNBand and the three comparators), net of transaction costs. Horizontal bars mark the pooled mean.}
+\label{fig:stage2_eval}
 \end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\linewidth]{file/phase1a/fig4_cost_turnover.png}
+\caption{Stage~2 cost and turnover comparison across methods: cumulative transaction cost, turnover, trade count, and band width. Bars show the five-seed mean; error bars show the 95\% training-seed interval. Band width bars are blank for methods without a band-width concept (structural, not zero).}
+\label{fig:stage2_cost_turnover}
+\end{figure}
+
+The previously reported single-seed Stage~2 training diagnostics (terminal-objective and direct-boundary-loss learning curves) could not be regenerated from a retained image file for this revision and have been removed rather than shown as placeholders; the underlying per-iteration training metrics remain available in the archived run outputs for each of the five training seeds.
 
 \section{Discussion}
 
@@ -1520,19 +1512,19 @@ The results illustrate how an institutional investment rule can separate three e
 
 This decomposition also clarifies why reinforcement learning is useful in this setting. The action is naturally a portfolio allocation, the state representation can be constructed to summarize economically relevant information, and the policy must account for the effect of current trading on future wealth and transaction opportunities. Incorporating domain knowledge into the state and policy does more than reduce dimension: the belief has a probabilistic interpretation, the Gaussian Stage~1 actor separates myopic and hedging demand, and the Stage~2 boundary explains when rebalancing is deferred. The same framework permits domain knowledge to enter the objective through target wealth, entropy, turnover, leverage, and transaction-cost terms.
 
-For insurers and pension funds, the target wealth can serve as a reduced-form accumulation or funding objective, while the trading band can reflect an operational preference for stable allocations and controlled turnover. The current results are methodological demonstrations rather than investment recommendations. Their practical value lies in providing a transparent architecture that could later accommodate liability cash flows, capital constraints, prescribed asset limits, and institution-specific transaction budgets.
+For insurers and pension funds, the target wealth can serve as a reduced-form accumulation or funding objective, while the trading band can reflect an operational preference for stable allocations and controlled turnover. Across the five-seed Phase~1A replication, the no-trade region reduced the mean number of trades by approximately 30\% relative to daily center rebalancing (Section~\ref{sec:stage2_vs_stage1}), which can be read as evidence that the framework offers an operational turnover-discipline benefit in addition to its net-performance statement, not only as a net-wealth result. The current results are methodological demonstrations rather than investment recommendations, and actual market impact, transaction-cost nonlinearity, and liability dynamics are not modeled. Their practical value lies in providing a transparent architecture that could later accommodate liability cash flows, capital constraints, prescribed asset limits, and institution-specific transaction budgets.
 
 \subsection{What is exact and what is approximate}
 
 The common-covariance Stage~1 model has the strongest theoretical status: filtering produces an observable diffusion, the entropy-regularized HJB yields the Gaussian optimizer, and the wealth-quadratic ansatz produces exact lower-dimensional coefficient PDEs under the stated regularity conditions. The SJM layer is an estimation methodology that supplies parameters to this filter; it is not part of the control verification theorem.
 
-For regime-dependent covariance, the discrete-time Gaussian prediction--correction filter is exact for the specified hidden Markov observation model, but the belief-averaged effective diffusion and its HJB are moment-matched approximations. For transaction costs, the QVI is the theoretical benchmark and the center-relative critic/intervention actor is exploratory. The reported Direct Boundary RL method produced a numerically usable pathwise policy in the displayed experiment, with a separate terminal objective; it is not a numerical solution of that QVI.
+For regime-dependent covariance, the discrete-time Gaussian prediction--correction filter is exact for the specified hidden Markov observation model, but the belief-averaged effective diffusion and its HJB are moment-matched approximations. For transaction costs, the QVI is the theoretical benchmark and the center-relative critic/intervention actor is exploratory. Center+DNNBand, the reported Direct Boundary RL method, produced a numerically usable pathwise policy across all five training seeds, with a separate terminal objective; it is not a numerical solution of that QVI.
 
 \subsection{Lessons from theory-guided learning}
 
-The experiments suggest an asymmetric role for structural theory. In Stage~1, the common-covariance HJB identifies the Gaussian policy family, the linear dependence of its mean on wealth, the quadratic critic, and the lower-dimensional coefficient functions. These restrictions remove large parts of the learning problem without materially narrowing the theorem-level optimizer. The resulting actor--critic provided usable training and favorable displayed results under both common and regime-dependent covariance. Because a controlled structured-versus-unstructured ablation has not yet been completed, the present evidence does not identify the restrictions themselves as the sole cause of the observed performance.
+The experiments suggest an asymmetric role for structural theory. In Stage~1, the common-covariance HJB identifies the Gaussian policy family, the linear dependence of its mean on wealth, the quadratic critic, and the lower-dimensional coefficient functions. These restrictions remove large parts of the learning problem without materially narrowing the theorem-level optimizer. The resulting actor--critic provided usable training and favorable displayed results under both common and regime-dependent covariance. The very small between-seed dispersion in Stage~1 (between-training-seed standard deviation of mean terminal wealth $\approx 0.000232$, against a within-seed evaluation-path standard deviation of $0.267$) is consistent with the stabilizing role of the HJB-restricted actor and critic, although the current experiments do not causally identify that restriction as the source of stability: because a controlled structured-versus-unstructured ablation has not yet been completed, the present evidence does not identify the restrictions themselves as the sole cause of the observed performance.
 
-The Stage~2 experience is different. The QVI identifies the enlarged state, the intervention-versus-continuation logic, and the relevance of a no-trade region, but it does not determine the finite-horizon multidimensional boundary geometry as sharply as the Stage~1 HJB determines the Gaussian actor. Jointly learning the QVI critic, obstacle residual, trigger, and intervention map was unstable, while preliminary generic deep-RL and Transformer-style formulations also failed to produce a sufficiently reliable policy within the available experiments. This comparison does not identify the encoder architecture or the absence of a particular parametrization as the unique cause of instability. The Direct Boundary architecture instead imposed economically meaningful center-relative no-trade geometry, retained feasibility constraints and pathwise transaction costs, and produced a numerically usable implementation.
+The Stage~2 experience is different. The QVI identifies the enlarged state, the intervention-versus-continuation logic, and the relevance of a no-trade region, but it does not determine the finite-horizon multidimensional boundary geometry as sharply as the Stage~1 HJB determines the Gaussian actor. Jointly learning the QVI critic, obstacle residual, trigger, and intervention map was unstable, while preliminary generic deep-RL and Transformer-style formulations also failed to produce a sufficiently reliable policy within the available experiments. This comparison does not identify the encoder architecture or the absence of a particular parametrization as the unique cause of instability. The Direct Boundary architecture instead imposed economically meaningful center-relative no-trade geometry, retained feasibility constraints and pathwise transaction costs, and produced a numerically usable implementation. Consistent with a less sharply identified boundary geometry, Stage~2's between-training-seed standard deviation of mean net terminal wealth was approximately $0.0163$ -- about $70$ times larger than Stage~1's between-training-seed standard deviation of mean terminal wealth ($\approx 0.000232$) -- indicating materially greater sensitivity to training initialization than Stage~1 under the same five-seed protocol.
 
 The methodological lesson is not that stronger structural restrictions are always preferable. Theory-guided parametrization is most effective when the underlying control equation identifies the relevant functional form with sufficient precision. When theory supplies only local or qualitative information about a free boundary, a softer inductive bias combined with simulation-based learning may be preferable to enforcing a misspecified low-dimensional geometry. The formula-based QVI actor remains valuable as an interpretable target and potential regularizer, but not yet as the reported optimizer.
 
@@ -1552,13 +1544,24 @@ The SJM produced a practically usable persistent segmentation in the reported ex
 
 Because the reported SJM features are constructed primarily from an equal-weight return index, covariance regimes are identified only indirectly through univariate aggregate-return features. Incorporating cross-sectional dispersion, realized correlation, or rolling covariance features is an important robustness extension, especially because covariance-state variation is a central motivation for the regime-dependent model.
 
-The Stage~2 results have a similarly specific interpretation. Daily rebalancing to the frictionless center has lower displayed mean net wealth than monthly rebalancing, consistent with repeated proportional costs offsetting the marginal tracking benefit. Direct Boundary RL has the highest displayed mean net wealth, but the current evidence does not determine whether the difference comes primarily from lower trading frequency, asymmetric boundaries, belief conditioning, or time-to-go conditioning. Those mechanisms require turnover decomposition and ablation analysis.
+The Stage~2 results have a similarly specific interpretation. Daily rebalancing to the frictionless center has lower mean net wealth than monthly rebalancing, consistent with repeated proportional costs offsetting the marginal tracking benefit. Center+DNNBand has the highest mean net wealth among the reported comparators and reduces mean trade count relative to daily rebalancing, and turnover, cumulative transaction cost, trade count, and band width are now reported as separate summary statistics (Table~\ref{tab:stage2_means}, Figure~\ref{fig:stage2_cost_turnover}) rather than inferred only from net wealth. However, the current evidence does not determine whether the net-wealth difference comes primarily from lower trading frequency, asymmetric boundaries, belief conditioning, or time-to-go conditioning: separating these mechanisms causally requires an ablation analysis that has not been performed.
 
 \subsection{Limitations and robustness status}
 
-The numerical results in this draft are based on representative single-seed runs. A five-seed replication using common independently generated evaluation paths is currently in progress. Until those results are incorporated, the figures and tables should be interpreted as evidence of feasibility and qualitative behavior, not as definitive estimates of performance across training seeds.
-
-Filtering quality depends on the regime segmentation and parameter estimates, and the estimated transition persistence differs materially from the simulator. The regime-dependent covariance control layer is moment-matched rather than exact, and $\widetilde c(p)$ has not been identified from a continuous-time filtering theorem. Stage~2 changes from the Stage~1 mean--variance criterion to a terminal utility objective, so the frictionless center is a structural feature rather than the exact zero-cost optimizer of the Stage~2 objective. The attempted QVI-based RL was unstable, while hard componentwise projection in Direct Boundary RL is interpretable but does not represent the most general multidimensional intervention geometry. Finally, liabilities, solvency capital, taxes, market impact, and governance constraints are not explicitly modeled.
+The common-covariance Stage~1 and Stage~2 experiments have now been verified across five independent training seeds on a common evaluation design (Section~\ref{sec:stage1_results}--\ref{sec:stage2_vs_stage1}), which resolves the single-seed limitation noted in earlier drafts for those two components specifically. The following limitations remain:
+\begin{enumerate}[label=(\arabic*)]
+\item Five training seeds are informative about sensitivity to training initialization but remain a small sample; the reported Student-$t$ intervals should not be read as tight population-level confidence statements.
+\item The regime-dependent-covariance experiment (Section~\ref{sec:regcov_results}) remains single-seed and exploratory; it is not part of the five-seed replication.
+\item Transaction-cost sensitivity (varying $\kappa$ and the leverage cap) has not been examined.
+\item An actor-signal ablation separating the martingale and full-horizon terms, and a structured-versus-unstructured policy-class ablation, have not been performed.
+\item Per-timestep wealth trajectories were not persisted by the evaluation code, so a time-resolved (rather than terminal-only) multi-seed wealth-path analysis is not currently available.
+\item A true, time-resolved cap-saturation rate has not been measured. The reported \texttt{share\_\allowbreak paths\_\allowbreak avg\_\allowbreak leverage\_\allowbreak near\_\allowbreak cap} diagnostic (threshold: whole-path average gross leverage $\ge 1.980$) is a path-average proxy over the fraction of evaluation paths, not a per-timestep saturation rate, and should not be read as one.
+\item Separate lower- and upper-boundary summary statistics were not persisted by the evaluation code; only the combined band width is reported.
+\item Stage~1 and Stage~2 optimize different terminal objectives, so comparisons between them (Section~\ref{sec:stage2_vs_stage1}) are descriptive, not a test of dominance under a common objective.
+\item Filtering quality depends on the regime segmentation and parameter estimates, and the estimated transition persistence differs materially from the simulator in the regime-dependent-covariance experiment; the associated control layer is moment-matched rather than exact, and $\widetilde c(p)$ has not been identified from a continuous-time filtering theorem.
+\item The attempted QVI-based RL was unstable, and hard componentwise projection in Center+DNNBand is interpretable but does not represent the most general multidimensional intervention geometry.
+\item Liabilities, solvency capital, taxes, market impact, and governance constraints are not explicitly modeled.
+\end{enumerate}
 
 \subsection{Future research}
 
@@ -1576,7 +1579,9 @@ This paper starts from the view that reinforcement learning is well matched to d
 
 The main contributions are the operational multi-asset implementation of partially observed mean--variance actor--critic learning; the integration of SJM-based regime estimation with online filtering; a discretized Gaussian filtering and approximate HJB extension for regime-dependent covariance; and a two-stage transaction-cost framework that connects a QVI benchmark, a formula-based intervention actor, and Direct Boundary learning. The covariance extension is important because changing volatility and correlation directly affect diversification and risk control, even when expected-return differences are difficult to estimate reliably.
 
-The representative numerical results are consistent with the intended role of the structure. In the displayed single-seed runs, the common-covariance HJB-guided policy has more favorable target-wealth outcomes than the static rules, and the regime-dependent covariance surrogate has higher mean terminal wealth and lower dispersion than the displayed static benchmarks. These results suggest that the simple belief-averaged approximation can be useful despite unresolved convergence and verification questions, but they do not establish general or statistically significant dominance. With transaction costs, Direct Boundary RL has higher displayed mean net terminal wealth than daily or monthly center rebalancing. These observations remain conditional on the reported runs and do not yet provide a full turnover or transaction-cost attribution.
+The five-seed common-covariance study provides different robustness conclusions for the two learning stages. Stage~1 converged to nearly identical held-out performance across training seeds, with mean terminal wealth $1.1811$ and very small between-seed dispersion. In Stage~2, Center+DNNBand achieved the highest average net terminal wealth among the reported transaction-cost-aware comparators and retained a positive paired difference relative to daily and monthly center rebalancing. It also reduced mean trade count by approximately 30\% relative to daily rebalancing. However, Stage~2 was materially more sensitive to training initialization, and its descriptive net-wealth difference from Stage~1 had a 95\% interval that included zero. The evidence therefore supports robustness relative to the reported Stage~2 comparators, not a claim that Stage~2 statistically dominates the frictionless Stage~1 policy.
+
+The regime-dependent-covariance evidence remains exploratory and single-seed (Section~\ref{sec:regcov_results}) and is not covered by the five-seed robustness statements above. Center+DNNBand is not a numerical solution of the transaction-cost QVI derived in this paper; it is a structurally motivated but separately optimized implementation. The paper's contribution is the selective use of financial structure -- filtering, HJB-consistent policy geometry, and a frictionless center -- to constrain what must be learned, not a claim that either stage is a verified optimal control solution. An actuarial application of this framework would require a further extension to a complete asset--liability management setting, incorporating stochastic liabilities, capital constraints, and institution-specific admissibility rules.
 
 The broader methodological conclusion is that the contribution lies not in deep learning alone, but in selectively using financial structure to determine the information state, restrict policy geometry, and design the objective, while retaining flexible learning where the control theory does not identify the optimal functional form sufficiently sharply. Stage~1 uses strong low-dimensional restrictions because the Gaussian actor and quadratic critic are characterized by the HJB. In Stage~2, the free-boundary geometry is less completely identified, so flexible simulation-based boundary learning provided the usable implementation, while the QVI and center-relative formulas remain theoretical and architectural guides. For actuarial and institutional applications, this combination of interpretable belief states, structured policies, and transaction-aware rebalancing offers a tractable portfolio-control building block. A complete ALM implementation would additionally require stochastic liabilities, capital constraints, and institution-specific admissibility rules.
 
@@ -1684,6 +1689,35 @@ A soft residual objective may combine terminal supervision with penalties for ne
 +\lambda_{co}\E[(R_{\mathrm{cont}}R_{\mathrm{obs}})^2],
 \end{equation}
 where $r^-=\min(r,0)$. This was the intended critic-based Stage~2 direction. In practice, simultaneous fitting of these residuals and the intervention actor was unstable, motivating the Direct Boundary RL implementation reported in the main text.
+
+\section{Complete Phase~1A Paired Comparisons}
+\label{app:paired_full}
+
+Table~\ref{tab:paired_full} reports all eleven Stage~2 paired comparisons computed for the five-seed Phase~1A replication, extending the four comparisons selected for the main text (Table~\ref{tab:paired_comparisons}). Methodology is identical: differences are computed at the evaluation-path level within each of the five training seeds, averaged within the seed, and then aggregated across seeds using the Student-$t$ critical value with four degrees of freedom. Rows marked ``descriptive'' compare methods with different rebalancing rules or, in the Stage~2-versus-Stage~1 case, different terminal objectives; they are not dominance claims.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Complete set of Phase~1A paired comparisons, $5$ training seeds $\times$ $1000$ evaluation paths per seed.}
+\label{tab:paired_full}
+\begin{tabular}{lcccc}
+\toprule
+Comparison & Mean diff.\ & 95\% interval & Excl.\ zero? & Type \\
+\midrule
+Stage~2 net $-$ Stage~1 terminal wealth & $0.0198$ & $[-0.0003,\,0.0400]$ & no & descriptive \\
+Gross $-$ net, Center+DNNBand & $0.0187$ & $[0.0148,\,0.0227]$ & yes & cost decomposition \\
+Gross $-$ net, CenterOnly daily & $0.0496$ & $[0.0496,\,0.0497]$ & yes & cost decomposition \\
+Gross $-$ net, CenterOnly monthly & $0.0120$ & $[0.0120,\,0.0120]$ & yes & cost decomposition \\
+Gross $-$ net, EW monthly & $0.0029$ & $[0.0029,\,0.0029]$ & yes & cost decomposition \\
+Center+DNNBand $-$ CenterOnly daily & $0.0910$ & $[0.0709,\,0.1112]$ & yes & descriptive \\
+Center+DNNBand $-$ CenterOnly monthly & $0.0780$ & $[0.0578,\,0.0981]$ & yes & descriptive \\
+Center+DNNBand $-$ EW monthly & $0.1637$ & $[0.1436,\,0.1839]$ & yes & descriptive \\
+CenterOnly daily $-$ CenterOnly monthly & $-0.0131$ & $[-0.0131,\,-0.0130]$ & yes & descriptive \\
+CenterOnly daily $-$ EW monthly & $0.0727$ & $[0.0725,\,0.0729]$ & yes & descriptive \\
+CenterOnly monthly $-$ EW monthly & $0.0858$ & $[0.0856,\,0.0860]$ & yes & descriptive \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \begin{thebibliography}{99}
 
