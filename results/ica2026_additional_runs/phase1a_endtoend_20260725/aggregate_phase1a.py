@@ -839,7 +839,7 @@ def make_table4_full_intervals(agg: pd.DataFrame, out_dir: Path) -> pd.DataFrame
 # ---------------------------------------------------------------------------
 
 def fig1_mean_vs_std(seed_level: pd.DataFrame, agg: pd.DataFrame, out_dir: Path):
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
     specs = [("stage1", "RL", "Stage 1 (RL)"), ("stage2", "Center+DNNBand", "Stage 2 (Center+DNNBand)")]
     plot_rows = []
     for ax, (stage, method, title) in zip(axes, specs):
@@ -865,7 +865,7 @@ def fig1_mean_vs_std(seed_level: pd.DataFrame, agg: pd.DataFrame, out_dir: Path)
         ax.legend(fontsize=7, loc="best")
         ax.grid(alpha=0.3)
     fig.suptitle("Mean terminal wealth vs. terminal wealth dispersion, across 5 training seeds")
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
     fig.savefig(out_dir / "figures" / "fig1_mean_vs_std.pdf")
     fig.savefig(out_dir / "figures" / "fig1_mean_vs_std.png", dpi=200)
     plt.close(fig)
@@ -955,9 +955,9 @@ def fig4_cost_turnover(agg: pd.DataFrame, out_dir: Path):
         ax.set_xticks(x, [STAGE2_METHOD_SHORT[m] for m in STAGE2_METHODS], rotation=20, ha="right", fontsize=8)
         ax.set_title(title)
         ax.grid(alpha=0.3, axis="y")
-    fig.suptitle("Stage 2: cost / turnover comparison across methods (bars = 5-seed mean, "
-                 "error bars = 95% Student-$t$ training-seed interval, four degrees of freedom)")
-    fig.tight_layout()
+    fig.suptitle("Stage 2 cost and turnover comparison\n(bars: 5-seed mean; error bars: 95% training-seed interval)",
+                 fontsize=12)
+    fig.tight_layout(rect=[0.02, 0, 0.98, 0.90])
     fig.savefig(out_dir / "figures" / "fig4_cost_turnover.pdf")
     fig.savefig(out_dir / "figures" / "fig4_cost_turnover.png", dpi=200)
     plt.close(fig)
@@ -965,7 +965,7 @@ def fig4_cost_turnover(agg: pd.DataFrame, out_dir: Path):
 
 
 def fig5_training_seed_variability(seed_level: pd.DataFrame, out_dir: Path):
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
     specs = [("stage1", "RL", "Stage 1 (RL): mean terminal wealth by seed"),
              ("stage2", "Center+DNNBand", "Stage 2 (Center+DNNBand): mean terminal wealth by seed")]
     for ax, (stage, method, title) in zip(axes, specs):
@@ -980,7 +980,7 @@ def fig5_training_seed_variability(seed_level: pd.DataFrame, out_dir: Path):
         ax.legend(fontsize=8)
         ax.grid(alpha=0.3, axis="y")
     fig.suptitle("Training-seed variability - not a single representative run")
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
     fig.savefig(out_dir / "figures" / "fig5_training_seed_variability.pdf")
     fig.savefig(out_dir / "figures" / "fig5_training_seed_variability.png", dpi=200)
     plt.close(fig)
