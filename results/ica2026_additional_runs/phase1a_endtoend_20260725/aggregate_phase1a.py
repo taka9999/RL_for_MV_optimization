@@ -939,7 +939,7 @@ def fig4_cost_turnover(agg: pd.DataFrame, out_dir: Path):
     metrics = [("mean_cumulative_tc", "Cumulative transaction cost", axes[0, 0]),
                ("mean_turnover", "Turnover", axes[0, 1]),
                ("mean_num_trades", "Number of trades", axes[1, 0]),
-               ("mean_band_width", "Band width", axes[1, 1])]
+               ("mean_band_width", "Band width (DNNBand only)", axes[1, 1])]
     rows = []
     for metric, title, ax in metrics:
         means, errs = [], []
@@ -951,7 +951,26 @@ def fig4_cost_turnover(agg: pd.DataFrame, out_dir: Path):
             rows.append({"method": m, "metric": metric, "mean": r["mean"],
                         "ci95_low": r["ci95_low"], "ci95_high": r["ci95_high"]})
         x = np.arange(len(STAGE2_METHODS))
-        ax.bar(x, means, yerr=errs, capsize=4, color="tab:blue", alpha=0.8)
+        if metric == "mean_band_width":
+            # Band width is only a defined quantity for Center+DNNBand; the
+            # comparator policies contain no no-trade band, so their entries
+            # are not-applicable rather than zero. Draw only the DNNBand bar
+            # and mark the other positions explicitly as "N/A" text (not a
+            # zero-height bar), without altering any underlying values.
+            dnn_idx = STAGE2_METHODS.index("Center+DNNBand")
+            bar_x = [x[dnn_idx]]
+            bar_mean = [means[dnn_idx]]
+            bar_err = [errs[dnn_idx]]
+            ax.bar(bar_x, bar_mean, yerr=bar_err, capsize=4, color="tab:blue", alpha=0.8)
+            y_na = 0.12 * max(means[dnn_idx], 1e-9)
+            for i, m in enumerate(STAGE2_METHODS):
+                if m == "Center+DNNBand":
+                    continue
+                ax.text(x[i], y_na, "N/A", ha="center", va="bottom",
+                        fontsize=9, color="#333333", weight="medium")
+            ax.set_ylim(bottom=0)
+        else:
+            ax.bar(x, means, yerr=errs, capsize=4, color="tab:blue", alpha=0.8)
         ax.set_xticks(x, [STAGE2_METHOD_SHORT[m] for m in STAGE2_METHODS], rotation=20, ha="right", fontsize=8)
         ax.set_title(title)
         ax.grid(alpha=0.3, axis="y")
