@@ -129,7 +129,7 @@ inference, terminal credit assignment, and transaction costs interact over
 long horizons. The framework therefore restricts the learned policy to
 economically interpretable, center-relative geometry and estimates only
 lower-dimensional coefficients or boundaries, rather than learning an
-unrestricted state-to-portfolio map. For the costly problem, the frictionless solution is used as an advanced start so that Stage~2 learns a correction around an economically meaningful benchmark rather than the full policy from scratch.
+unrestricted state-to-portfolio map. For the costly problem, the frictionless solution provides a structured initialization so that Stage~2 learns a correction around an economically meaningful benchmark rather than the full policy from scratch.
 
 Regime changes are also not limited to expected returns. Volatility levels and cross-asset correlations can change materially across market conditions, and these covariance shifts directly affect diversification, risk budgets, capital requirements, and the scale of admissible positions. For practical portfolio and risk management, covariance misspecification may therefore be at least as consequential as drift misspecification. This motivates the regime-dependent-covariance extension, while the common-covariance model is retained as the theorem-level benchmark needed to identify which HJB structures can be transferred safely.
 
@@ -143,7 +143,11 @@ The paper makes the following contributions.
 \begin{enumerate}[label=(\roman*)]
 \item \textbf{A belief-state Hamilton--Jacobi--Bellman (HJB) reduction of partially observed mean--variance control, including a regime-dependent-covariance extension.} Under common observation covariance, Wonham filtering reduces the partially observed control problem to a fully observed diffusion on the belief state, and the entropy-regularized HJB equation for this belief-state problem admits a closed-form Gaussian exploratory policy together with a wealth-quadratic value function solving a lower-dimensional coefficient PDE system. We extend this reduction to regime-dependent covariance by combining an exact Gaussian Bayes correction for a discretized hidden-Markov observation model with a moment-matched, belief-averaged control approximation, deriving the resulting approximate HJB, Gaussian policy, and coefficient equations, including the additional nonlinear term that vanishes in the common-covariance benchmark. This is the central theoretical contribution of the paper; no verification or approximation-error theorem is claimed for the regime-dependent extension, and its supporting numerical experiment is a separate single-seed exploratory result outside the paper's five-seed robustness analysis.
 
-\item \textbf{A structure-guided actor--critic implementation of the belief-state HJB reduction (Stage~1).} We make the multi-asset belief-state actor--critic operational: the Gaussian policy family, its wealth-linear mean, and the wealth-quadratic critic are fixed by the HJB reduction above, so learning is restricted to a low-dimensional set of belief/time coefficients rather than an unrestricted state-to-weight map. Regime-specific drift, covariance, and transition-intensity estimates are supplied to the online Bayesian filter by a statistical jump model applied to persistent offline labels, integrating an established regime-identification method with the HJB-guided control pipeline rather than proposing new SJM statistical theory.
+\item \textbf{A structure-guided actor--critic implementation of the belief-state HJB reduction (Stage~1).} We make the multi-asset belief-state actor--critic operational: the Gaussian policy family, its wealth-linear mean, and the wealth-quadratic critic are fixed by the HJB reduction above, so learning is restricted to a low-dimensional set of belief/time coefficients rather than an unrestricted state-to-weight map. Parameter and transition-intensity estimates are supplied to the online
+Bayesian filter by a statistical jump model (SJM) applied to persistent
+offline labels. This integrates an established regime-identification method
+with the HJB-guided control pipeline rather than introducing new SJM
+methodology.
 
 \item \textbf{A two-stage transaction-cost architecture with a learned no-trade boundary (Stage~2).} We formulate the costly extension of the Stage~1 problem as a quasi-variational inequality (QVI) on the enlarged state $(t,x,p,\bw)$ and derive a center-relative critic/intervention parametrization consistent with its continuation and intervention structure. Because joint QVI-residual and intervention learning was numerically unstable, the reported implementation retains the QVI's robust structural implications---a frictionless center, an inaction region, feasibility constraints, and pathwise transaction costs---and learns asymmetric no-trade boundaries directly around the frozen Stage~1 center through Direct Boundary policy optimization: a critic-free method that optimizes a separate transaction-cost-aware terminal objective by differentiating directly through simulated wealth paths. The QVI remains the theoretical benchmark, but the evaluated boundary policy is not its numerical solution.
 
@@ -656,7 +660,8 @@ g_\theta(t,p)=(T-t)\widetilde g_\theta(t,p),
 \end{equation}
 which guarantees $f_\theta(T,p)=1$ and $g_\theta(T,p)=0$; alternatively, the terminal equations can be imposed through supervised residual penalties.
 
-More concretely, the code fixes the wealth dependence through $(x-\omega)$ and learns only low-dimensional belief/time coefficients. A representative actor is
+The implementation fixes the wealth dependence through $(x-\omega)$ and
+learns only low-dimensional belief- and time-dependent coefficients. A representative actor is
 \begin{equation}
 \bpi_\phi(\bu\mid t,x,p)
 =\N\left(
@@ -739,7 +744,10 @@ Writing $\operatorname{sg}(\cdot)$ for a stop-gradient operation, a cost-minimiz
 \end{equation}
 Positive values of the cost signal reduce the probability of the sampled action under gradient descent. The separate entropy derivative in \eqref{eq:actor_loss_stage1} is required because the entropy depends directly on $\phi$ and is not recovered by stopping the gradient through $s_k$. Under a reward convention, both the signal and the optimization sign must be reversed consistently.
 
-The implementation permits one or more critic updates per outer iteration and normalizes the martingale and tail signals within a batch. The reported configurations use one critic step. The pure martingale-difference update is closest to continuous-time theory but was empirically slow and noisy; the mixed signal with weight $\eta=0.3$ provided a stronger full-horizon correction in the representative runs. This modification is algorithmic rather than a new control theorem.
+The pure martingale-difference update is closest to the continuous-time
+theory. The implemented mixed signal sets $\eta=0.3$, assigning 30\% weight
+to the normalized full-horizon tail residual. This is an algorithmic
+finite-sample refinement rather than a new control theorem.
 
 The multiplier is updated through the sample terminal-wealth constraint,
 \begin{equation}
@@ -787,7 +795,7 @@ In the threshold-based configuration, $Y_l=0.19$ and $Y_u=0.24$ are fixed hyperp
 
 \subsection{Statistical jump model}
 
-The current regime-dependent-covariance experiment instead uses an equal-weight return index and constructs a standardized feature vector $z_k$ from rolling means and volatilities, downside deviation, rolling drawdown, short-versus-long mean spreads, and volatility ratios. Every rolling feature (rolling mean, rolling standard deviation, downside deviation, rolling drawdown, and the derived spreads and ratios) is constructed using only return observations available at or before time $k$; the subsequent feature standardization (z-scoring), however, is computed from the mean and standard deviation of the full estimation sample and is therefore not itself a causal, online transformation. A two-state statistical jump model jointly estimates regime representatives $\vartheta_1,\vartheta_2$ and a persistent label path $s_{1:n}$ by solving a problem of the form
+The reported regime-dependent-covariance experiment uses an equal-weight return index and constructs a standardized feature vector $z_k$ from rolling means and volatilities, downside deviation, rolling drawdown, short-versus-long mean spreads, and volatility ratios. Every rolling feature (rolling mean, rolling standard deviation, downside deviation, rolling drawdown, and the derived spreads and ratios) is constructed using only return observations available at or before time $k$; the subsequent feature standardization (z-scoring), however, is computed from the mean and standard deviation of the full estimation sample and is therefore not itself a causal, online transformation. A two-state statistical jump model jointly estimates regime representatives $\vartheta_1,\vartheta_2$ and a persistent label path $s_{1:n}$ by solving a problem of the form
 \begin{equation}
 \min_{\vartheta_1,\vartheta_2,\,s_{1:n}}
 \sum_{k=1}^n\|z_k-\vartheta_{s_k}\|_2^2
@@ -1277,11 +1285,14 @@ where
 \mathcal L_{gl}
 &=\E\Bigl[\tfrac1N\textstyle\sum_{k=0}^{N-1}\|\bw_k^+\|_1\Bigr],
 \end{align}
-the outer $\E[\cdot]$ denotes the average over simulated episodes, $N=252$ is the number of daily steps in the one-year horizon, and the factor $\tfrac12$ in $\mathcal L_g$ is the average (not sum) of the squared lower- and upper-gap norms over the two risky assets. In the implemented code, $\lambda_U$ is the scalar \texttt{utility\_scale} and $s_U$ is an additive shift \texttt{utility\_shift}; for the reported runs $\lambda_U=1$ and $s_U=0$, so the term reduces to $-\E[U(x_T)]$ as in a standard terminal-utility objective. The physical proportional transaction cost is already deducted from wealth in \eqref{eq:tc_wealth}. The additional turnover term $\mathcal L_{to}$ is therefore a deliberate governance and training regularizer---and a simple proxy for unmodeled market impact---rather than a second accounting deduction of the same transaction cost. The gap term $\mathcal L_g$ discourages uninformatively wide bands; the gross-leverage term $\mathcal L_{gl}$ is the only leverage control active during training; the separate, evaluation-only hard cap is discussed above and in Section~\ref{sec:experimental_design}.
+the outer $\E[\cdot]$ denotes the average over simulated episodes, $N=252$ is the number of daily steps in the one-year horizon, and the factor $\tfrac12$ in $\mathcal L_g$ is the average (not sum) of the squared lower- and upper-gap norms over the two risky assets. In the implemented objective, $\lambda_U$ is the utility scale and $s_U$ is
+an additive utility shift. For the reported configuration,
+$\lambda_U=1$ and $s_U=0$, so the term reduces to
+$-\E[U(x_T)]$ as in a standard terminal-utility objective. The physical proportional transaction cost is already deducted from wealth in \eqref{eq:tc_wealth}. The additional turnover term $\mathcal L_{to}$ is therefore a deliberate governance and training regularizer---and a simple proxy for unmodeled market impact---rather than a second accounting deduction of the same transaction cost. The gap term $\mathcal L_g$ discourages uninformatively wide bands; the gross-leverage term $\mathcal L_{gl}$ is the only leverage control active during training; the separate, evaluation-only hard cap is discussed above and in Section~\ref{sec:experimental_design}.
 
 In the reported configuration, $U$ is logarithmic utility, $U(x)=\log\bigl(\max(x,\epsilon)\bigr)$ with positivity floor $\epsilon=10^{-10}$ applied directly inside the utility evaluation (not as a separate bankruptcy-penalty term); no additional nonpositive-wealth penalty is added to the loss. Although the implementation exposes the parameters \texttt{utility\_gamma} and \texttt{gamma\_risk}, neither is active under the reported logarithmic-utility and direct-gap specification. Neither parameter therefore affects the reported policy or objective. The loss coefficients used are $\lambda_{to}=5\times10^{-4}$ (\texttt{turnover\_coef}), $\lambda_g=10^{-5}$ (\texttt{gap\_l2\_coef}), and $\lambda_{gl}=10^{-5}$ (\texttt{gross\_lev\_coef}), as recorded in Table~\ref{tab:stage2_config}. The checkpoint used for evaluation is selected, every $25$ training iterations, as the iteration with the highest mean validation utility $\E[U(x_T)]$ over $64$ held-out validation paths generated independently of both the training and the $1000$-path evaluation set. This validation utility is computed by the same band-only simulator used in training, i.e.\ without the evaluation-time leverage cap \eqref{eq:eval_projection}: the checkpoint-selection criterion and the final reported evaluation metrics are therefore not evaluated under an identical policy, since only the latter additionally applies the hard leverage cap on top of the learned band.
 
-Typical terminal utilities include logarithmic, square-root, and CRRA utility, all of which require an explicit treatment of nonpositive wealth.
+Typical terminal utilities include logarithmic, square-root, and constant-relative-risk-aversion (CRRA) utility, all of which require an explicit treatment of nonpositive wealth.
 
 Direct Boundary policy optimization is related to the HJB advanced-start strategy of Mulvey et al.~\cite{mulvey2020}: a tractable frictionless solution supplies information that makes the transaction-cost problem easier to learn. The QVI derivation above explains why a no-trade region and center-relative coordinates are natural, but the reported optimizer directly trains the restricted boundary policy class because the attempted QVI critic/intervention actor was unstable. The QVI remains the theoretical benchmark, but the evaluated boundary policy is not its numerical solution.
 
@@ -1462,7 +1473,9 @@ the Student-$t$ critical value with four degrees of freedom. Outputs from determ
 across training seeds, providing
 an additional consistency check on scenario alignment.
 
-The regime-dependent-covariance experiment reported in Section~\ref{sec:regcov_results} was not part of this five-seed replication and remains a single-seed exploratory result (Section~\ref{sec:regcov_results}).
+The regime-dependent-covariance experiment in
+Section~\ref{sec:regcov_results} was not part of the five-seed replication
+and remains a single-seed exploratory result.
 
 \subsection{Stage 1 results}
 \label{sec:stage1_results}
@@ -1536,7 +1549,13 @@ Table~\ref{tab:stage2_means} reports the five-seed transaction-cost-aware compar
 \begin{table}[H]
 \centering
 \small
-\caption{Stage~2 transaction-cost-aware performance across five independent training seeds, $1000$ common evaluation paths per seed. Every entry is a 5-seed mean of the corresponding per-seed statistic (itself already an average over that seed's $1000$ evaluation paths, and additionally over the $252$ within-path steps for Turnover and Band width); bracketed net-terminal-wealth values additionally report the 95\% Student-$t$ interval across the five training seeds. Gross $X_T$ is an accounting decomposition (net wealth plus the transaction cost otherwise deducted, along the same realized trade path), not an independent counterfactual zero-cost re-simulation -- see the metric-definition paragraph above and the discussion following this table. Cum.\ tc is defined as Gross $X_T$ minus Net $X_T$. Band width is a structural quantity defined only for Center+DNNBand; ``--'' denotes not applicable, not zero.}
+\caption{Stage~2 performance across five training seeds, each evaluated on
+the same $1000$ held-out paths. Entries are means of the five seed-level
+statistics; brackets report 95\% Student-$t$ intervals across training seeds
+for net terminal wealth. Turnover and band width are averaged over the
+$252$ decision dates. Gross terminal wealth follows the accounting definition
+in Section~\ref{sec:experimental_design}; ``--'' denotes a metric that is not
+applicable to the comparator.}
 \label{tab:stage2_means}
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{lccccccc}
@@ -1663,7 +1682,7 @@ The transaction-cost QVI derived in Section~7 provides the theoretical target,
 \begin{equation}
 \min\{-V_t-\mathcal LV,\ \mathcal MV-V\}=0,
 \end{equation}
-where $\mathcal M$ accounts for proportional wealth loss and a post-trade target map. The next methodological step is not to formulate this QVI again, but to stabilize its numerical learning: continuation/intervention sampling, obstacle-compatible losses, target networks for $\mathcal M V$, curriculum learning from a Direct Boundary policy, and smooth trigger approximations are natural candidates.
+where $\mathcal M$ accounts for proportional wealth loss and a post-trade target map. Future work should focus on stabilizing numerical learning of this QVI: continuation/intervention sampling, obstacle-compatible losses, target networks for $\mathcal M V$, curriculum learning from a Direct Boundary policy, and smooth trigger approximations are natural candidates.
 
 Broader sensitivity to transaction-cost rates, entropy weights, and filtering misspecification, together with ablations separating the effects of the belief state, HJB-guided parametrization, martingale signal, full-horizon residual, symmetric versus asymmetric bands, and QVI-derived priors, remain directions for future work. Stronger benchmarks should include a full-information regime oracle retrained under that information structure, a true-parameter filtered policy, a myopic policy without the belief-hedging term, and a fixed symmetric band. Supplying the true regime directly to a policy trained only on filtered beliefs would instead be an out-of-distribution stress test, not a formal oracle comparison. An actuarial extension should introduce stochastic liability cash flows, funding-ratio or surplus objectives, regulatory capital constraints, and asset eligibility limits so that the portfolio controller becomes a component of a complete ALM problem.
 

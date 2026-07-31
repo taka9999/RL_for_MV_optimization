@@ -998,7 +998,7 @@ def fig5_training_seed_variability(seed_level: pd.DataFrame, out_dir: Path):
         ax.set_ylim(sub["mean_terminal_wealth"].min() * 0.95, sub["mean_terminal_wealth"].max() * 1.05)
         ax.legend(fontsize=8)
         ax.grid(alpha=0.3, axis="y")
-    fig.suptitle("Training-seed variability - not a single representative run")
+    fig.suptitle("Mean terminal wealth by training seed")
     fig.tight_layout(rect=[0, 0, 1, 0.94])
     fig.savefig(out_dir / "figures" / "fig5_training_seed_variability.pdf")
     fig.savefig(out_dir / "figures" / "fig5_training_seed_variability.png", dpi=200)
